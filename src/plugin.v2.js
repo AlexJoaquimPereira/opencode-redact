@@ -330,6 +330,7 @@ async function redactContentPart(part, { lint }) {
 async function redactToolResult(result, { lint }) {
   let workingResult = result;
   let totalRedactionCount = 0;
+  let annotated = false;
   const ruleIdSet = new Set();
 
   if (typeof workingResult.content === "string") {
@@ -338,6 +339,7 @@ async function redactToolResult(result, { lint }) {
       workingResult = { ...workingResult, content: scanned.text };
       totalRedactionCount += scanned.redactionCount;
       for (const ruleId of scanned.ruleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   } else if (Array.isArray(workingResult.content)) {
     const blocks = [];
@@ -365,6 +367,7 @@ async function redactToolResult(result, { lint }) {
       workingResult = { ...workingResult, content: blocks };
       totalRedactionCount += blockTotal;
       for (const ruleId of blockRuleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   } else if (typeof workingResult.content === "undefined" && typeof workingResult.output === "string") {
     // design.md D6d: `content` absent entirely and `output` is a bare
@@ -374,6 +377,7 @@ async function redactToolResult(result, { lint }) {
       workingResult = { ...workingResult, output: scanned.text };
       totalRedactionCount += scanned.redactionCount;
       for (const ruleId of scanned.ruleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   }
 
@@ -394,9 +398,17 @@ async function redactToolResult(result, { lint }) {
   ) {
     const scanned = await scanAndRedact(workingResult.output.output, { lint });
     if (scanned.redactionCount > 0) {
-      workingResult = { ...workingResult, output: { ...workingResult.output, output: scanned.text } };
+      // When `content` was absent, this structured field is the only carrier
+      // of the redacted text, so attach the model-facing annotation here too —
+      // otherwise a redaction would occur with no note. When `content` was
+      // present it already carries the note, so the duplicate field stays bare.
+      const nextText = annotated
+        ? scanned.text
+        : `${scanned.text}\n\n${buildAnnotation(scanned.redactionCount, [...scanned.ruleIds].sort())}`;
+      workingResult = { ...workingResult, output: { ...workingResult.output, output: nextText } };
       totalRedactionCount += scanned.redactionCount;
       for (const ruleId of scanned.ruleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   }
 
@@ -625,6 +637,11 @@ export default {
       ctx.session.hook("context", (event) => redactSessionContextHandler(event, { lint }, log)),
       ctx.session.hook("generate", (event) => redactSessionContextHandler(event, { lint }, log)),
       ctx.session.hook("compaction", (event) => redactSessionContextHandler(event, { lint }, log)),
+      // `SessionTitle` is a distinct auxiliary provider request
+      // (SessionRequestKind includes "title") carrying system[] + messages[],
+      // so it must be redacted independently — the context hook does not fire
+      // for it.
+      ctx.session.hook("title", (event) => redactSessionContextHandler(event, { lint }, log)),
     ]);
 
     return async () => {

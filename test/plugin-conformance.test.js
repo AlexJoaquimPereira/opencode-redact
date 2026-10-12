@@ -27,13 +27,14 @@ function fakeV1Client() {
  * shape (design.md "Verified platform facts").
  */
 function fakeV2Ctx() {
-  const hooks = { "execute.after": null, prompt: null, context: null, generate: null, compaction: null };
+  const hooks = { "execute.after": null, prompt: null, context: null, generate: null, compaction: null, title: null };
   const disposals = {
     "execute.after": vi.fn().mockResolvedValue(undefined),
     prompt: vi.fn().mockResolvedValue(undefined),
     context: vi.fn().mockResolvedValue(undefined),
     generate: vi.fn().mockResolvedValue(undefined),
     compaction: vi.fn().mockResolvedValue(undefined),
+    title: vi.fn().mockResolvedValue(undefined),
   };
   const ctx = {
     tool: {
@@ -114,6 +115,15 @@ describe("V1/V2 adapter conformance — tool-output redaction", () => {
       }
     });
   }
+  it("V1 tool.execute.after redacts a secret in metadata (parity with V2)", async () => {
+    const { v1Hooks } = await loadV1();
+    const secret = RULE_FIXTURES[0].content;
+    const v1Output = { output: "clean text", metadata: { note: `leak=${secret}` } };
+    await v1Hooks["tool.execute.after"]({ tool: "bash" }, v1Output);
+    expect(v1Output.output).toBe("clean text");
+    expect(v1Output.metadata.note).toContain("***REDACTED:");
+    expect(v1Output.metadata.note).not.toContain(secret);
+  });
 });
 
 describe("V1/V2 adapter conformance — user-message redaction", () => {
@@ -304,6 +314,16 @@ describe("V2-only shape-specific cases", () => {
     expect(JSON.stringify(event.result.output)).toBe(before);
   });
 
+  it("execute.after: annotates a redaction carried only by a structured output.output (content absent)", async () => {
+    const { hooks } = await loadV2();
+    const secret = RULE_FIXTURES[0].content;
+    const event = { tool: "shell", status: "completed", result: { output: { exit: 0, output: `leak=${secret}` } } };
+    await hooks["execute.after"](event);
+    expect(event.result.output.output).toContain("***REDACTED:");
+    expect(event.result.output.output).not.toContain(secret);
+    expect(event.result.output.output).toContain("[opencode-redact]");
+  });
+
   it("execute.after: event.result is replaced wholesale (readonly fields)", async () => {
     const { hooks } = await loadV2();
     const secret = RULE_FIXTURES[0].content;
@@ -348,7 +368,7 @@ describe("V2-only shape-specific cases", () => {
 });
 
 describe("V2-only shape-specific cases — session context/generate/compaction hooks", () => {
-  const HOOK_NAMES = ["context", "generate", "compaction"];
+  const HOOK_NAMES = ["context", "generate", "compaction", "title"];
 
   it("setup registers context, generate, and compaction session hooks", async () => {
     const { ctx } = await loadV2();
@@ -539,7 +559,7 @@ describe("lifecycle", () => {
     expect(ctx.session.hook).toHaveBeenCalledWith("generate", expect.any(Function));
     expect(ctx.session.hook).toHaveBeenCalledWith("compaction", expect.any(Function));
     await cleanup();
-    for (const key of ["execute.after", "prompt", "context", "generate", "compaction"]) {
+    for (const key of ["execute.after", "prompt", "context", "generate", "compaction", "title"]) {
       expect(disposals[key]).toHaveBeenCalled();
     }
   });
