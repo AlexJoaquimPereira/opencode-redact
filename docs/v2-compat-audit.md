@@ -218,3 +218,16 @@ coverage gain.
 
 See `openspec/changes/archive/*-fix-v2-session-hook-coverage/` (once
 archived) for the full design record and delta specs.
+
+## Update — 2026-10-13 (loader constraints verified against @opencode/cli 2.0.26)
+
+- The config `plugins` array rejects a bare **absolute file path** with
+  `configured plugin path must be a directory`; only package names or
+  **directory** targets are accepted for local entries.
+- The package's default export (`.`) is the V1 adapter, so listing
+  `"opencode-redact"` by name on v2 fails with `PluginModule.LoadError:
+  Plugin must export a default definition with an id and an effect or setup
+  function`.
+- A working v2 install is a one-line shim in `.opencode/plugins/` that
+  re-exports `opencode-redact/v2` (or a local `src/plugin.v2.js`); see the
+  README "Install" section.

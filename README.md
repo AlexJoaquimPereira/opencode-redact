@@ -203,16 +203,29 @@ npm install
 ln -s "$(pwd)/src/plugin.v1.js" ~/.config/opencode/plugins/opencode-redact.js
 ```
 
-**V2:** add this package (or a local path) to `opencode.json(c)`'s `plugins`
-array, or drop `src/plugin.v2.js` directly into a project's or the global
-`.opencode/plugins/` directory. Note: `.opencode/plugins/` scans every `.js`
-file placed directly inside it as its own candidate plugin — this plugin's
-other source files (`redact.js`, `secretlint.js`, `config.js`, etc.) must
-never be copied alongside `plugin.v2.js` there; they are resolved via normal
-`node_modules` package resolution when installed as a real dependency.
+**V2:** OpenCode v2 requires a plugin whose default export is `{ id, setup }`.
+This package's own default export (`.`) is the **V1** adapter, so listing
+`"opencode-redact"` directly in the plugin list does **not** work on v2 — the
+loader rejects the V1 entry with a `PluginModule.LoadError`. Load the `/v2`
+entrypoint explicitly through a one-line shim in an `.opencode/plugins/`
+directory (project or global):
 
-Restart opencode. No further configuration is needed — there is no config
-file in v1 (see "Known limitations").
+```js
+// .opencode/plugins/opencode-redact.ts
+export { default } from "opencode-redact/v2";             // package in node_modules
+// or, from a local checkout:
+// export { default } from "/abs/path/opencode-redact/src/plugin.v2.js";
+```
+
+The shim re-exports the real adapter, so its sibling modules (`redact.js`,
+`secretlint.js`, `config.js`) and the `@secretlint/*` dependencies resolve
+from the package's own `node_modules` — do not copy those files next to the
+shim. If you use the config `plugins` array instead, note it accepts package
+names or **directory** targets only; a bare absolute *file* path is rejected
+with `configured plugin path must be a directory`.
+
+Restart opencode. No further configuration is needed — the only setting
+(high-entropy on/off) lives in `redact.jsonc` (see "Configuration").
 
 Unlike some other plugins with a peer dependency on `@opencode-ai/plugin`,
 this plugin needs no additional symlink step for its own dependencies — a
