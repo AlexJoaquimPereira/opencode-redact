@@ -192,12 +192,24 @@ describe("V1/V2 adapter conformance — user-message redaction", () => {
 });
 
 describe("V2-only shape-specific cases", () => {
-  it("execute.after: a status:\"error\" event is never scanned (design.md D6a)", async () => {
+  it("execute.after: redacts a secret in a non-enumerable error message (Tool.Error shape)", async () => {
     const { hooks } = await loadV2();
-    const event = { tool: "bash", status: "error", error: { message: `leak ${RULE_FIXTURES[0].content}` } };
-    const before = JSON.stringify(event);
+    const secret = RULE_FIXTURES[0].content;
+    const error = { metadata: { note: `meta ${secret}` } };
+    // Host `Tool.Error.message`/`.stack` are non-enumerable own properties;
+    // simulate that so a regression back to `Object.keys` fails here.
+    Object.defineProperty(error, "message", {
+      value: `leak ${secret}`,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    const event = { tool: "bash", status: "error", error };
     await hooks["execute.after"](event);
-    expect(JSON.stringify(event)).toBe(before);
+    expect(event.error.message).toContain("***REDACTED:");
+    expect(event.error.message).not.toContain(secret);
+    expect(event.error.metadata.note).toContain("***REDACTED:");
+    expect(event.error.metadata.note).not.toContain(secret);
   });
 
   it("execute.after: Content[] walk redacts text blocks, leaves file blocks untouched, one annotation on the last redacted block", async () => {

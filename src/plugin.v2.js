@@ -129,6 +129,76 @@ async function redactObjectStrings(value, { lint }, budget) {
 }
 
 /**
+ * Scans a single string leaf against a shared budget. Returns the redacted
+ * text, or `undefined` when the value is not a string, is empty, exceeds the
+ * remaining budget, or has no finding. Fail-open, like the rest of the plugin.
+ */
+async function scanLeaf(text, budget, lint) {
+  if (typeof text !== "string" || text.length === 0) return undefined;
+  if (text.length > budget.remaining) return undefined;
+  budget.remaining -= text.length;
+  const scanned = await scanAndRedact(text, { lint });
+  return scanned.redactionCount > 0 ? scanned.text : undefined;
+}
+
+/**
+ * Recursively redacts string leaves of an arbitrary value IN PLACE, preserving
+ * object identity and prototype. Used for host class instances (e.g. a tool
+ * error, a `Tool.Error` Schema.Class) where replacing the value with a plain
+ * clone could break the host. Read-only/frozen fields that throw on assignment
+ * are skipped (fail-open). Returns the number of leaves redacted.
+ */
+async function redactValueInPlace(value, { lint }, budget) {
+  let total = 0;
+  const seen = new WeakSet();
+  const walk = async (v) => {
+    if (!v || typeof v !== "object" || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i += 1) {
+        const item = v[i];
+        const next = await scanLeaf(item, budget, lint);
+        if (next !== undefined) {
+          try {
+            v[i] = next;
+            total += 1;
+          } catch {
+            // read-only entry; skip
+          }
+        } else if (item && typeof item === "object") {
+          await walk(item);
+        }
+      }
+      return;
+    }
+    // `getOwnPropertyNames` (not `Object.keys`): a host Error's `message` and
+    // `stack` are non-enumerable own properties, and `message` is the most
+    // likely carrier of a secret in a failed tool call.
+    for (const key of Object.getOwnPropertyNames(v)) {
+      let item;
+      try {
+        item = v[key];
+      } catch {
+        continue; // throwing getter; fail-open
+      }
+      const next = await scanLeaf(item, budget, lint);
+      if (next !== undefined) {
+        try {
+          v[key] = next;
+          total += 1;
+        } catch {
+          // read-only field; skip
+        }
+      } else if (item && typeof item === "object") {
+        await walk(item);
+      }
+    }
+  };
+  await walk(value);
+  return total;
+}
+
+/**
  * Redacts a V2 tool result (design.md D6): only `status === "completed"` is
  * ever scanned (D6a — a tool error's `error: Tool.Error` is left alone,
  * both because V1 never saw this branch either and because handling it
@@ -359,8 +429,23 @@ export default {
     const registrations = await Promise.all([
       ctx.tool.hook("execute.after", async (event) => {
         try {
+          if (event.status === "error") {
+            // Tightened: a tool failure's error payload is exactly where
+            // secrets surface (stack traces, env dumps, connection strings).
+            // `Tool.Error` is a host Schema.Class, so redact its string leaves
+            // IN PLACE to preserve identity/prototype (a plain clone could
+            // break host serialization).
+            if (event.error && typeof event.error === "object") {
+              const budget = { remaining: METADATA_SCAN_BUDGET_CHARS };
+              const count = await redactValueInPlace(event.error, { lint }, budget);
+              if (count > 0) {
+                log("warn", `redacted ${count} secret(s) in tool '${event.tool}' error`);
+              }
+            }
+            return;
+          }
+
           if (event.status !== "completed") {
-            // design.md D6a: a tool error is never scanned here.
             return;
           }
 
