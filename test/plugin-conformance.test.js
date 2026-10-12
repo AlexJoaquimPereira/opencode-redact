@@ -192,7 +192,7 @@ describe("V1/V2 adapter conformance — user-message redaction", () => {
 });
 
 describe("V2-only shape-specific cases", () => {
-  it("execute.after: redacts a secret in a non-enumerable error message (Tool.Error shape)", async () => {
+  it('execute.after: redacts a secret in a non-enumerable error message (Tool.Error shape)', async () => {
     const { hooks } = await loadV2();
     const secret = RULE_FIXTURES[0].content;
     const error = { metadata: { note: `meta ${secret}` } };
@@ -397,7 +397,7 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       expect(event.messages[0].content[0].text).not.toContain(secret);
     });
 
-    it(`${name}: non-text message content is left untouched`, async () => {
+    it(`${name}: redacts a secret in a tool-call input (tightened)`, async () => {
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
       const toolCallBlock = { type: "tool-call", id: "1", name: "bash", input: { cmd: `leak=${secret}` } };
@@ -407,7 +407,92 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
         messages: [{ role: "assistant", content: [toolCallBlock] }],
       };
       await hooks[name](event);
-      expect(event.messages[0].content[0]).toBe(toolCallBlock);
+      expect(event.messages[0].content[0].input.cmd).toContain("***REDACTED:");
+      expect(event.messages[0].content[0].input.cmd).not.toContain(secret);
+    });
+
+    it(`${name}: redacts a secret in a tool-result value (tightened)`, async () => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const event = {
+        sessionID: "s1",
+        system: [],
+        messages: [
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                id: "1",
+                name: "bash",
+                result: { type: "error", value: { message: `leak ${secret}` } },
+              },
+            ],
+          },
+        ],
+      };
+      await hooks[name](event);
+      const serialized = JSON.stringify(event.messages[0].content[0]);
+      expect(serialized).toContain("***REDACTED:");
+      expect(serialized).not.toContain(secret);
+    });
+
+    it(`${name}: redacts a non-enumerable message inside a tool-result value (tightened)`, async () => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const value = {};
+      Object.defineProperty(value, "message", {
+        value: `leak ${secret}`,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+      const event = {
+        sessionID: "s1",
+        system: [],
+        messages: [
+          {
+            role: "tool",
+            content: [
+              { type: "tool-result", id: "1", name: "bash", result: { type: "error", value } },
+            ],
+          },
+        ],
+      };
+      await hooks[name](event);
+      const stored = event.messages[0].content[0].result.value;
+      expect(stored.message).toContain("***REDACTED:");
+      expect(stored.message).not.toContain(secret);
+    });
+
+    it(`${name}: redacts a secret in a reasoning part (tightened)`, async () => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const event = {
+        sessionID: "s1",
+        system: [],
+        messages: [{ role: "assistant", content: [{ type: "reasoning", text: `think ${secret}` }] }],
+      };
+      await hooks[name](event);
+      expect(event.messages[0].content[0].text).toContain("***REDACTED:");
+      expect(event.messages[0].content[0].text).not.toContain(secret);
+    });
+
+    it(`${name}: leaves media and effort parts untouched`, async () => {
+      const { hooks } = await loadV2();
+      const mediaPart = {
+        type: "media",
+        media: { source: { type: "base64", data: "AAAA", mediaType: "image/png" } },
+      };
+      const effortPart = { type: "effort", effort: "high" };
+      const event = {
+        sessionID: "s1",
+        system: [],
+        messages: [{ role: "assistant", content: [mediaPart, effortPart] }],
+      };
+      await hooks[name](event);
+      expect(event.messages[0].content[0]).toBe(mediaPart);
+      expect(event.messages[0].content[1]).toBe(effortPart);
     });
 
     it(`${name}: one annotation for multiple redactions in the system prompt`, async () => {
