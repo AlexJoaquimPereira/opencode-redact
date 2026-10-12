@@ -181,8 +181,9 @@ unchanged. When a tool's output is delivered as discrete segments of
 different kinds, the system SHALL scan only text-kind segments and SHALL
 leave any non-text segment (e.g. a reference to a file's contents, rather
 than the file's contents themselves) completely untouched. The system SHALL
-NOT scan a tool invocation's output when that invocation did not complete
-successfully. The system SHALL bound the total volume of text scanned
+scan a tool invocation's error payload when that invocation did not complete
+successfully, replacing each detected secret so a failure's stack trace or
+error body never reaches the LLM. The system SHALL bound the total volume of text scanned
 within a single tool result's metadata, so that an unusually large or
 deeply nested metadata value cannot make the scan itself unbounded.
 
@@ -211,10 +212,11 @@ deeply nested metadata value cannot make the scan itself unbounded.
 - **THEN** that segment is left completely unmodified and is never passed
   to the secret scanner
 
-#### Scenario: Output of an unsuccessful tool invocation is not scanned
-- **WHEN** a tool invocation did not complete successfully (it errored or
-  was otherwise not completed)
-- **THEN** its output is not scanned or modified by this system
+#### Scenario: Output of an unsuccessful tool invocation IS scanned
+- **WHEN** a tool invocation did not complete successfully (it errored) and
+  its error payload contains a detectable secret
+- **THEN** that secret is replaced with a redaction placeholder before the
+  error reaches the LLM
 
 #### Scenario: A secret in the tool result's metadata is redacted
 - **WHEN** a tool result's metadata contains a string field with a
