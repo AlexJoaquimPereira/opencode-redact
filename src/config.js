@@ -34,6 +34,10 @@ const KEY_VALIDATORS = {
  * missing file: silent defaults, never an error.
  */
 export function resolveConfigPath() {
+  const override = process.env.OPENCODE_CONFIG_DIR;
+  if (typeof override === "string" && override.length > 0) {
+    return join(override, CONFIG_FILE_NAME);
+  }
   if (!xdgConfig) {
     return null;
   }
