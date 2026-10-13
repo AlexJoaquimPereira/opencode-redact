@@ -235,9 +235,9 @@ see `docs/v2-compat-audit.md` for why.
 
 ## Configuration
 
-This plugin has exactly one setting, in v1: whether high-entropy detection
-is on. Everything else — which vendor rules run, thresholds, the allowlist —
-is fixed and not configurable.
+This plugin has two settings: whether high-entropy detection is on, and how
+the plugin logs. Everything else — which vendor rules run, thresholds, the
+allowlist — is fixed and not configurable.
 
 Create `redact.jsonc` (JSON with comments; trailing commas are fine) in
 opencode's own configuration directory — the same directory the `plugins/`
@@ -247,9 +247,26 @@ folder above lives in (`$XDG_CONFIG_HOME/opencode/redact.jsonc`, i.e.
 ```jsonc
 {
   // Turn off the high-entropy check; every other rule keeps running.
-  "disableHighEntropy": true
+  "disableHighEntropy": true,
+
+  // Logging (optional). Defaults: level "warn", sink "stderr".
+  "log": {
+    "level": "warn",            // silent | error | warn | info | debug
+    "sink": "stderr",           // stderr | file | none
+    "file": "~/.local/state/opencode/opencode-redact.log", // used when sink is "file"
+    "maxBytes": 1048576         // rotate to <file>.1 once the file reaches this size
+  }
 }
 ```
+
+**Logging.** The default (`stderr`, `warn`) is unchanged from earlier
+versions. A managed opencode server does not capture plugin stderr into
+opencode's own log file, so set `sink` to `"file"` for a JSONL audit trail at
+`<XDG state>/opencode/opencode-redact.log` (created `0600`, size-capped).
+Every record contains only non-sensitive metadata — timestamps, levels,
+counts, detection rule ids, a source label, a tool name, and configuration key
+names — never a matched secret, its surrounding text, or a configuration
+value. Logging is fail-open: a sink error never breaks a turn.
 
 - The file is entirely optional — no file means every default applies
   (high-entropy detection **on**).

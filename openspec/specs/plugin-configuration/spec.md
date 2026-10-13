@@ -54,7 +54,10 @@ wrong type.
 ### Requirement: Warn On Unknown Configuration Keys Without Failing
 The system SHALL log a warning naming any key present in `redact.jsonc`
 that this capability does not define, and SHALL continue applying every
-recognized key normally.
+recognized key normally. The recognized keys are the detection setting
+`disableHighEntropy` (see "Disable High-Entropy Detection Via Configuration")
+and the logging settings under `log` (see the `plugin-logging` capability);
+`log` and its sub-keys are recognized, not unknown.
 
 #### Scenario: Unknown key is warned about but does not block valid keys
 - **WHEN** `redact.jsonc` contains a key this capability does not define,
