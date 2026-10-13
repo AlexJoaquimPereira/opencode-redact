@@ -13,13 +13,18 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "jsonc-parser";
 import { xdgConfig } from "xdg-basedir";
+import { DEFAULT_LOG_CONFIG, normalizeLogConfig } from "./log.js";
 
 export const CONFIG_FILE_NAME = "redact.jsonc";
 
 /**
- * The only setting in v1. Defaults to enabled (`false` = do not disable).
+ * The only detection setting in v1. Defaults to enabled (`false` = do not
+ * disable). `log` carries the plugin's logging settings.
  */
-export const DEFAULT_PLUGIN_CONFIG = Object.freeze({ disableHighEntropy: false });
+export const DEFAULT_PLUGIN_CONFIG = Object.freeze({
+  disableHighEntropy: false,
+  log: DEFAULT_LOG_CONFIG,
+});
 
 const KEY_VALIDATORS = {
   disableHighEntropy: (value) => typeof value === "boolean",
@@ -87,6 +92,15 @@ export async function loadPluginConfig({ configPath = resolveConfigPath(), log =
   let hadWarning = false;
 
   for (const key of Object.keys(parsed)) {
+    if (key === "log") {
+      const { value, warnings } = normalizeLogConfig(parsed.log);
+      result.log = value;
+      for (const warning of warnings) {
+        await log("warn", warning);
+        hadWarning = true;
+      }
+      continue;
+    }
     const validate = KEY_VALIDATORS[key];
     if (!validate) {
       await log("warn", `plugin configuration file contains unknown key '${key}'; ignoring it`);

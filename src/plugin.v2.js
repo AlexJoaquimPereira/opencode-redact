@@ -21,6 +21,7 @@
 
 import { createSecretlintConfig, createCompositeLinter } from "./secretlint.js";
 import { loadPluginConfig } from "./config.js";
+import { createLogger } from "./log.js";
 import { redactSecrets, redactUserMessage, buildAnnotation, buildUserMessageAnnotation, scanAndRedact } from "./redact.js";
 
 const PLUGIN_NAME = "opencode-redact";
@@ -32,13 +33,6 @@ const PLUGIN_NAME = "opencode-redact";
 // own per-call timeout unchanged; this only bounds how many such calls one
 // metadata walk can issue.
 const METADATA_SCAN_BUDGET_CHARS = 200_000;
-
-/** Returns a logger function; V2's Context.app has no log method (design.md D3), so this is stderr-only. */
-function makeLogger() {
-  return (level, message) => {
-    process.stderr.write(`[${PLUGIN_NAME}] [${level}] ${message}\n`);
-  };
-}
 
 /**
  * Redacts a single V2 `Tool.Content` block in place. Returns
@@ -521,7 +515,11 @@ async function redactSessionContextHandler(event, { lint }, log) {
     if (Array.isArray(event.system) && event.system.length > 0) {
       const { redactionCount, ruleIds } = await redactContentArray(event.system, { lint });
       if (redactionCount > 0) {
-        log("warn", `redacted ${redactionCount} secret(s) in assembled system prompt (rules: ${ruleIds.join("+")})`);
+        log("warn", `redacted ${redactionCount} secret(s) in assembled system prompt (rules: ${ruleIds.join("+")})`, {
+          source: "system-prompt",
+          count: redactionCount,
+          ruleIds,
+        });
       }
     }
 
@@ -532,7 +530,11 @@ async function redactSessionContextHandler(event, { lint }, log) {
         }
         const { redactionCount, ruleIds } = await redactContentArray(message.content, { lint });
         if (redactionCount > 0) {
-          log("warn", `redacted ${redactionCount} secret(s) in a message's content (rules: ${ruleIds.join("+")})`);
+          log("warn", `redacted ${redactionCount} secret(s) in a message's content (rules: ${ruleIds.join("+")})`, {
+            source: "message-history",
+            count: redactionCount,
+            ruleIds,
+          });
         }
       }
     }
@@ -562,16 +564,16 @@ export default {
     const loadConfig = testOverrides._createSecretlintConfigOverride ?? createSecretlintConfig;
     const buildLinter = testOverrides._createLinterOverride ?? createCompositeLinter;
 
-    const log = makeLogger();
-
-    // Step 1 (design.md D2): the plugin's own optional settings file. Never
-    // throws, by loadPluginConfig's own contract — no try/catch needed, and
-    // this step MUST NOT share a try block with step 2, so a config-file
-    // problem can never be reported inside, or mistaken for, the fail-loud
-    // secretlint-config failure.
+    // Bootstrap logger with defaults so configuration-load warnings have a
+    // sink before the configured logger exists; the configured logger is
+    // built immediately after and used for everything else.
+    const bootstrapLog = createLogger();
     const pluginConfig = await loadPlugConfig({
-      log: (level, message) => log(level, message),
+      log: (level, message) => bootstrapLog.log(level, message),
     });
+
+    const logger = createLogger(pluginConfig.log ?? {});
+    const log = (level, message, fields) => logger.log(level, message, fields);
 
     // Step 2: the secretlint rule bundle itself. May throw — fail loud,
     // unchanged from V1's behavior.
@@ -599,7 +601,11 @@ export default {
               const budget = { remaining: METADATA_SCAN_BUDGET_CHARS };
               const count = await redactValueInPlace(event.error, { lint }, budget);
               if (count > 0) {
-                log("warn", `redacted ${count} secret(s) in tool '${event.tool}' error`);
+                log("warn", `redacted ${count} secret(s) in tool '${event.tool}' error`, {
+                  source: "tool-error",
+                  tool: event.tool,
+                  count,
+                });
               }
             }
             return;
@@ -615,7 +621,12 @@ export default {
           }
 
           event.result = result;
-          log("warn", `redacted ${redactionCount} secret(s) in tool '${event.tool}' output (rules: ${ruleIds.join("+")})`);
+          log("warn", `redacted ${redactionCount} secret(s) in tool '${event.tool}' output (rules: ${ruleIds.join("+")})`, {
+            source: "tool-output",
+            tool: event.tool,
+            count: redactionCount,
+            ruleIds,
+          });
         } catch (err) {
           log("error", `redaction handler failed for tool '${event?.tool}': ${err?.message}`);
         }
@@ -649,7 +660,11 @@ export default {
           } catch (err) {
             log("error", `failed to append user-message redaction annotation: ${err?.message ?? err}`);
           }
-          log("warn", `redacted ${redactionCount} secret(s) in user message (rules: ${ruleIds.join("+")})`);
+          log("warn", `redacted ${redactionCount} secret(s) in user message (rules: ${ruleIds.join("+")})`, {
+            source: "prompt",
+            count: redactionCount,
+            ruleIds,
+          });
         } catch (err) {
           log("error", `user-message redaction handler failed: ${err?.message ?? err}`);
         }

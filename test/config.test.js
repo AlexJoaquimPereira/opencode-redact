@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { loadPluginConfig, resolveConfigPath, DEFAULT_PLUGIN_CONFIG } from "../src/config.js";
+import { DEFAULT_LOG_CONFIG } from "../src/log.js";
 
 let tmpDir;
 
@@ -51,6 +52,22 @@ describe("resolveConfigPath", () => {
 });
 
 describe("loadPluginConfig", () => {
+  it("parses a valid log block", async () => {
+    const configPath = tempConfigPath(
+      JSON.stringify({ log: { level: "info", sink: "file", file: "/tmp/x.log", maxBytes: 10 } }),
+    );
+    const result = await loadPluginConfig({ configPath, log: vi.fn() });
+    expect(result.log).toEqual({ level: "info", sink: "file", file: "/tmp/x.log", maxBytes: 10 });
+  });
+
+  it("falls back to the default log config and warns on an invalid log block", async () => {
+    const configPath = tempConfigPath(JSON.stringify({ log: "nope" }));
+    const log = vi.fn();
+    const result = await loadPluginConfig({ configPath, log });
+    expect(result.log).toEqual(DEFAULT_LOG_CONFIG);
+    expect(log).toHaveBeenCalledWith("warn", expect.stringContaining("log"));
+  });
+
   it("returns all defaults and logs nothing when the file does not exist", async () => {
     const configPath = join(mkdtempSync(join(tmpdir(), "opencode-redact-config-test-")), "does-not-exist.jsonc");
     const log = vi.fn();
@@ -118,7 +135,7 @@ describe("loadPluginConfig", () => {
     const configPath = tempConfigPath('{ "disableHighEntropy": true, "someUnknownKey": 123 }');
     const log = vi.fn();
     const result = await loadPluginConfig({ configPath, log });
-    expect(result).toEqual({ disableHighEntropy: true });
+    expect(result).toEqual({ disableHighEntropy: true, log: DEFAULT_LOG_CONFIG });
     expect(log).toHaveBeenCalledWith("warn", expect.stringContaining("someUnknownKey"));
   });
 
@@ -134,7 +151,7 @@ describe("loadPluginConfig", () => {
     const configPath = tempConfigPath('{ "disableHighEntropy": true }');
     const log = vi.fn();
     const result = await loadPluginConfig({ configPath, log });
-    expect(result).toEqual({ disableHighEntropy: true });
+    expect(result).toEqual({ disableHighEntropy: true, log: DEFAULT_LOG_CONFIG });
     expect(log).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith("info", expect.any(String));
   });
@@ -146,7 +163,7 @@ describe("loadPluginConfig", () => {
     }`);
     const log = vi.fn();
     const result = await loadPluginConfig({ configPath, log });
-    expect(result).toEqual({ disableHighEntropy: true });
+    expect(result).toEqual({ disableHighEntropy: true, log: DEFAULT_LOG_CONFIG });
   });
 
   it("never includes a configuration value in any log message, only key names", async () => {
