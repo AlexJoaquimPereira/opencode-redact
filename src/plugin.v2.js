@@ -47,11 +47,13 @@ function makeLogger() {
  * `type:"file"` blocks are URI references with no inline body, and are
  * left completely untouched).
  */
-async function redactContentBlock(block, { lint }) {
+async function redactContentBlock(block, { lint, honorNoRedact = false }) {
   if (!block || block.type !== "text" || typeof block.text !== "string") {
     return { block, redactionCount: 0, ruleIds: [] };
   }
-  const scanned = await scanAndRedact(block.text, { lint });
+  const scanned = honorNoRedact
+    ? await redactUserMessage(block.text, { lint })
+    : await scanAndRedact(block.text, { lint });
   if (scanned.redactionCount === 0) {
     return { block, redactionCount: 0, ruleIds: [] };
   }
@@ -239,13 +241,13 @@ async function redactToolResult(result, { lint }) {
  * by `Tool.Content[]`, `event.system[]`, and each message's `content[]`).
  * Returns `{redactionCount, ruleIds}` for the caller's own logging.
  */
-async function redactTextBlockArray(blocks, { lint }) {
+async function redactTextBlockArray(blocks, { lint, honorNoRedact = false }) {
   let total = 0;
   const ruleIdSet = new Set();
   let lastRedactedIndex = -1;
 
   for (let i = 0; i < blocks.length; i += 1) {
-    const redacted = await redactContentBlock(blocks[i], { lint });
+    const redacted = await redactContentBlock(blocks[i], { lint, honorNoRedact });
     if (redacted.redactionCount > 0) {
       blocks[i] = redacted.block;
       total += redacted.redactionCount;
@@ -300,7 +302,11 @@ async function redactSessionContextHandler(event, { lint }, log) {
         if (!Array.isArray(message?.content) || message.content.length === 0) {
           continue;
         }
-        const { redactionCount, ruleIds } = await redactTextBlockArray(message.content, { lint });
+        // User role is the exemption boundary, not proof of human authorship.
+        const { redactionCount, ruleIds } = await redactTextBlockArray(message.content, {
+          lint,
+          honorNoRedact: message.role === "user",
+        });
         if (redactionCount > 0) {
           log("warn", `redacted ${redactionCount} secret(s) in a message's content (rules: ${ruleIds.join("+")})`);
         }
