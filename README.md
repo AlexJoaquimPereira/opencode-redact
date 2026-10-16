@@ -287,8 +287,20 @@ rm ~/.config/opencode/plugins/opencode-redact.js
   truncates very large tool output to a managed on-disk retention path
   *before* this hook runs; redacting the in-context string does not redact
   that spill file.
-- **`output.metadata` and `output.attachments` are not scanned** — only
-  `output.output`.
+- **`output.attachments` is not scanned.** Tool-result `metadata` IS scanned
+  (a V1-parity fix in this plugin); `attachments` carries references/URLs,
+  not inline text, so it is left untouched by the redactor.
+- **Provider-signed reasoning is not redacted.** In the V2 session hooks, a
+  `reasoning` part is left completely untouched — its text and its
+  `providerMetadata` (proof-of-generation: Anthropic signature, Gemini
+  thought signature, OpenAI encrypted content) travel as generated, because
+  Anthropic and AWS Bedrock reject requests whose thinking blocks were
+  modified after generation. A secret inside such a part is intentionally
+  not replaced; redacting signed reasoning needs a provider-compatible
+  confidentiality policy and a tool-use/replay regression test, tracked as
+  a follow-up. Refs:
+  [Anthropic — extended thinking](https://platform.claude.com/docs/en/build-with-claude/thinking),
+  [AWS Bedrock — conversation inference](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
 - **The GCP p12 (binary) check never fires.** The GCP rule only runs when
   the scanned content's extension is `.json` or `.p12`; this plugin detects
   JSON-shaped text automatically and scans it as `.json`, but `.p12` is a

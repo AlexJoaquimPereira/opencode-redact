@@ -485,17 +485,25 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       expect(stored.message).not.toContain(secret);
     });
 
-    it(`${name}: redacts a secret in a reasoning part (tightened)`, async () => {
+    it(`${name}: leaves a reasoning part with its providerMetadata untouched (signed-reasoning exemption)`, async () => {
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
+      const reasoningPart = {
+        type: "reasoning",
+        text: `think ${secret}`,
+        providerMetadata: { anthropic: { signature: "sig-for-signed-thinking", redacted: false } },
+      };
       const event = {
         sessionID: "s1",
         system: [],
-        messages: [{ role: "assistant", content: [{ type: "reasoning", text: `think ${secret}` }] }],
+        messages: [{ role: "assistant", content: [reasoningPart] }],
       };
       await hooks[name](event);
-      expect(event.messages[0].content[0].text).toContain("***REDACTED:");
-      expect(event.messages[0].content[0].text).not.toContain(secret);
+      expect(event.messages[0].content[0]).toBe(reasoningPart);
+      expect(event.messages[0].content[0].text).toBe(`think ${secret}`);
+      expect(event.messages[0].content[0].providerMetadata).toEqual({
+        anthropic: { signature: "sig-for-signed-thinking", redacted: false },
+      });
     });
 
     it(`${name}: leaves media and effort parts untouched`, async () => {

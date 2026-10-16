@@ -283,8 +283,9 @@ async function redactResultValue(result, { lint }) {
 /**
  * Redacts any one `ContentPart` variant, returning a new part only when
  * changed. Media parts (binary/base64/url/ref) and effort parts are never
- * touched; tool-call inputs and tool-result values are deep-scanned; text,
- * reasoning, and compaction parts scan their `.text`.
+ * touched; tool-call inputs and tool-result values are deep-scanned; text
+ * and compaction parts scan their `.text`; reasoning parts are left
+ * completely untouched (see the `case "reasoning"` note below).
  *
  * Note: redacting `tool-call.input` rewrites the model's own prior tool-call
  * arguments in the replayed request payload. That is intentional for
@@ -297,8 +298,17 @@ async function redactContentPart(part, { lint }) {
   }
   switch (part.type) {
     case "text":
-    case "reasoning":
       return redactTextField(part, "text", { lint });
+    case "reasoning":
+      // Provider-signed: a reasoning part's providerMetadata carries proof of
+      // generation (Anthropic signature, Gemini thought signature, OpenAI
+      // encrypted content). Anthropic and AWS Bedrock reject requests whose
+      // thinking blocks were modified after generation, so scanning this
+      // part's text and returning an edited part while keeping the signature
+      // is invalid protocol state — the part is exempted entirely. Redacting
+      // signed reasoning is out of scope until a provider-compatible
+      // confidentiality policy exists (docs/v2-compat-audit.md).
+      return { part, count: 0, ruleIds: [] };
     case "compaction":
       if (typeof part.text !== "string") return { part, count: 0, ruleIds: [] };
       return redactTextField(part, "text", { lint });
@@ -435,13 +445,15 @@ async function redactToolResult(result, { lint }) {
 
 /**
  * Redacts an array of ContentPart variants (text, reasoning, compaction,
- * tool-call, tool-result, media, effort) in place via `redactContentPart`.
- * When anything was redacted, exactly one `buildAnnotation` note is appended
- * to the last redacted part that carries a string `.text` (text/reasoning/
- * compaction) — the aggregate-then-annotate-once shape shared by
- * `Tool.Content[]`, `event.system[]`, and each message's `content[]`. Parts
- * with no text field (tool-call/tool-result) are redacted without an
- * annotation. Returns `{redactionCount, ruleIds}` for the caller's logging.
+ * tool-call, tool-result, media, effort) by replacing changed slots via
+ * `redactContentPart` (copy-on-write; nothing is written in place and
+ * untouched parts keep their identity). When anything was redacted, exactly
+ * one `buildAnnotation` note is appended to the last redacted part that
+ * carries a string `.text` (text/compaction) — the aggregate-then-
+ * annotate-once shape shared by `Tool.Content[]`, `event.system[]`, and each
+ * message's `content[]`. Parts with no redacted text (tool-call/tool-result)
+ * are redacted without an annotation. Returns `{redactionCount, ruleIds}`
+ * for the caller's logging.
  */
 async function redactContentArray(blocks, { lint }) {
   let total = 0;
@@ -484,11 +496,20 @@ async function redactContentArray(blocks, { lint }) {
  * `event.system[]` elements always have the exact `{type:"text", text}`
  * shape `redactContentBlock` expects (verified: `SystemPart` is not a
  * union), so it is reused unchanged. `event.messages[].content[]` is a
- * six-member tagged union (`Message.content: ContentPart[]`); only
- * `type === "text"` blocks share that same shape and are redacted --
- * every other variant (media, tool-call, tool-result, reasoning,
- * compaction, effort) is left untouched (D3, mirrors the archived design's
- * D6c precedent of scanning only a verified-safe union member).
+ * six-member tagged union (`Message.content: ContentPart[]`); text,
+ * compaction, tool-call, and tool-result parts are scanned (the latter two
+ * deep-walked copy-on-write), while media and effort parts and provider-
+ * signed reasoning parts are left completely untouched: reasoning parts
+ * carry providerMetadata proof-of-generation (Anthropic signature, Gemini
+ * thought signature, OpenAI encrypted content) that loses validity if the
+ * text is edited, and both Anthropic and AWS Bedrock reject modified
+ * thinking blocks (D3, mirrors the archived design's D6c precedent of
+ * scanning only verified-safe union members).
+ *
+ * Ownership: the host derives `system`/`messages` fresh per provider call
+ * and consumes the hook-modified arrays only for the outgoing request —
+ * array-slot replacement never reaches the session's persisted message
+ * history (traced with file:line references in docs/v2-compat-audit.md).
  *
  * Annotation is aggregated once per container (D2: the whole `system[]`
  * array; D3: each message's own `content[]` independently) via

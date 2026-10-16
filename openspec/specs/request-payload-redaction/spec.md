@@ -31,9 +31,14 @@ The system SHALL scan the text-bearing content of every message in a
 re-derived message-history payload assembled for a provider request and
 SHALL replace each detected secret substring with a redaction placeholder.
 This covers every `ContentPart` variant that carries model-bound text —
-`text`, `reasoning`, and `compaction` parts' `.text`, a `tool-call` part's
-`input`, and a `tool-result` part's `result.value` (its `json`/`text`/`error`
-variants and the text blocks of its `content` variant). Media parts
+`text` and `compaction` parts' `.text`, a `tool-call` part's `input`, and a
+`tool-result` part's `result.value` (its `json`/`text`/`error` variants and
+the text blocks of its `content` variant). A `reasoning` part SHALL be left
+completely unmodified — including its text and `providerMetadata` — because
+its metadata certifies the text ("provider-signed reasoning") and provider
+SDKs (e.g. Anthropic, AWS Bedrock) reject requests whose thinking blocks
+were modified after generation; scanning it is deferred to a follow-up with
+a provider-compatible confidentiality policy. Media parts
 (binary/base64/url/ref) and `effort` parts SHALL be left completely
 unmodified.
 
@@ -50,6 +55,13 @@ unmodified.
 #### Scenario: Media content is left untouched
 - **WHEN** a message in a re-derived history payload contains a `media` part
 - **THEN** that part is left completely unmodified
+
+#### Scenario: Signed reasoning is left untouched
+- **WHEN** a message in a re-derived history payload contains a `reasoning`
+  part that carries `providerMetadata` proof-of-generation
+- **THEN** the part is left completely unmodified — its text keeps the
+  detected secret and its `providerMetadata` is unchanged — and no
+  annotation is added
 
 ### Requirement: Cover Every Request-Assembly Point Independently
 The system SHALL apply system-prompt and message-history redaction whenever
