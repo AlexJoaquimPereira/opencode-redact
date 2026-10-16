@@ -253,7 +253,7 @@ folder above lives in (`$XDG_CONFIG_HOME/opencode/redact.jsonc`, i.e.
   "log": {
     "level": "warn",            // silent | error | warn | info | debug
     "sink": "stderr",           // stderr | file | none
-    "file": "~/.local/state/opencode/opencode-redact.log", // used when sink is "file"
+    // Omit "file" to use the default XDG state-directory log path.
     "maxBytes": 1048576         // rotate to <file>.1 once the file reaches this size
   }
 }
@@ -263,7 +263,10 @@ folder above lives in (`$XDG_CONFIG_HOME/opencode/redact.jsonc`, i.e.
 versions. A managed opencode server does not capture plugin stderr into
 opencode's own log file, so set `sink` to `"file"` for a JSONL audit trail at
 `<XDG state>/opencode/opencode-redact.log` (created `0600`, size-capped).
-Every record contains only non-sensitive metadata — timestamps, levels,
+**Omit `"file"`** to use that default; a configured `file` value is used
+**literally, with no `~` expansion** — a leading `~/` would create a
+directory named `~` in the current working directory. Every record contains
+only non-sensitive metadata — timestamps, levels,
 counts, detection rule ids, a source label, a tool name, and configuration key
 names — never a matched secret, its surrounding text, or a configuration
 value. Logging is fail-open: a sink error never breaks a turn.
