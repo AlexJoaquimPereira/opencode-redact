@@ -80,6 +80,15 @@ rationale.
   - A malformed or unterminated fence is **not** exempt — see "Known
     limitations".
   - This fence is honored **only** in user messages, never in tool output.
+    In V2, the exemption persists through `context`, `generate`, and
+    `compaction` request rescans for messages whose role is exactly `user`.
+    System-prompt segments and messages with any other or missing role remain
+    scanned, including inside fences. Each text block is parsed independently;
+    a fence cannot span blocks or messages.
+  - **V2 role is not proof of human authorship.** Synthetic messages, expanded
+    file text, and compaction summaries represented as user-role text also
+    receive the exemption. A real secret inside a valid fence in that text
+    can reach the model provider; no provenance check is performed.
 - Exactly **one** annotation is appended per message (to the last part that
   was actually redacted), aggregating the count and rule ids across every
   redacted part — not one annotation per part. The wording is deliberately

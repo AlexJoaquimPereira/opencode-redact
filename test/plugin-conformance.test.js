@@ -59,9 +59,9 @@ async function loadV1() {
   return { client, v1Hooks };
 }
 
-async function loadV2() {
+async function loadV2(testOverrides = {}) {
   const { ctx, hooks, disposals } = fakeV2Ctx();
-  const cleanup = await PluginV2.setup(ctx);
+  const cleanup = await PluginV2.setup(ctx, testOverrides);
   return { ctx, hooks, disposals, cleanup };
 }
 
@@ -367,6 +367,7 @@ describe("V2-only shape-specific cases", () => {
   });
 });
 
+// spec: openspec/specs/request-payload-redaction/spec.md
 describe("V2-only shape-specific cases — session context/generate/compaction hooks", () => {
   const HOOK_NAMES = ["context", "generate", "compaction", "title"];
 
@@ -654,6 +655,146 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       expect(event.messages[0].content[0].text).toBe(CLEAN_TEXT);
     });
   }
+});
+
+// spec: openspec/specs/request-payload-redaction/spec.md
+describe("V2 user-role noredact request rescans", () => {
+  const secret = RULE_FIXTURES.find((f) => f.rule === "aws").content;
+  const secondSecret = RULE_FIXTURES.find((f) => f.rule === "privatekey").content;
+  const fenced = `\`\`\`noredact\n${secret}\n\`\`\``;
+  const hookNames = ["context", "generate", "compaction"];
+  // Keep annotation/count assertions independent of overlapping entropy findings.
+  const testOverrides = { _loadPluginConfigOverride: async () => ({ disableHighEntropy: true }) };
+  const textBlock = (text) => ({ type: "text", text });
+  const userEvent = (...blocks) => ({ system: [], messages: [{ role: "user", content: blocks }] });
+
+  it("User-role fences survive chained and repeated rescans", async () => {
+    const { hooks } = await loadV2(testOverrides);
+    const prompt = { prompt: { text: `${fenced}\noutside=${secondSecret}` } };
+    await hooks.prompt(prompt);
+    expect(prompt.prompt.text).toContain(fenced);
+    expect(prompt.prompt.text).not.toContain(secondSecret);
+    const event = userEvent(textBlock(prompt.prompt.text));
+    const admittedText = prompt.prompt.text;
+    for (const name of [...hookNames, ...hookNames]) {
+      await hooks[name](event);
+      expect(event.messages[0].content[0].text).toBe(admittedText);
+    }
+    event.messages[0].content[0].text += `\nnew=${secondSecret}`;
+    await hooks.context(event);
+    expect(event.messages[0].content[0].text).toContain(fenced);
+    expect(event.messages[0].content[0].text).not.toContain(secondSecret);
+    expect(event.messages[0].content[0].text.match(/\[opencode-redact\]/g)).toHaveLength(2);
+  });
+
+  for (const name of hookNames) {
+    describe(name, () => {
+      it("User-role fences survive each request-assembly stage", async () => {
+        const { hooks } = await loadV2(testOverrides);
+        const event = userEvent(textBlock(fenced));
+        await hooks[name](event);
+        expect(event.messages[0].content[0].text).toBe(fenced);
+        await hooks[name](event);
+        expect(event.messages[0].content[0].text).toBe(fenced);
+      });
+
+      it("Mixed user-role blocks retain aggregate annotations", async () => {
+        const { hooks } = await loadV2(testOverrides);
+        const nonText = { type: "reasoning", text: secret };
+        const blocks = [
+          { ...textBlock(`outside=${secret}\n${fenced}`), metadata: { note: "keep" } },
+          nonText,
+          textBlock(`outside=${secondSecret}`),
+          textBlock(fenced),
+        ];
+        const event = userEvent(...blocks);
+        await hooks[name](event);
+        const content = event.messages[0].content;
+        expect(content[0].text).toContain(fenced);
+        expect(content[0].text.replace(fenced, "")).not.toContain(secret);
+        expect(content[0].text).not.toContain("[opencode-redact]");
+        expect(content[0].metadata).toEqual({ note: "keep" });
+        expect(content[1]).toBe(nonText);
+        expect(content[2].text).not.toContain(secondSecret);
+        expect(content[2].text).toContain("2 secret(s)");
+        expect(content[2].text).toContain("rules: aws+privatekey");
+        expect(content[2].text.match(/\[opencode-redact\]/g)).toHaveLength(1);
+        expect(content[3].text).toBe(fenced);
+      });
+
+      it("Malformed user-role fences remain scanned", async () => {
+        const { hooks } = await loadV2(testOverrides);
+        for (const text of [
+          `\`\`\`noredact extra\n${secret}\n\`\`\``,
+          `\`\`\`noredact\n${secret}`,
+          `\`\`\`noredact\n${secret}\n\`\`\`\``,
+        ]) {
+          const event = userEvent(textBlock(text));
+          await hooks[name](event);
+          expect(event.messages[0].content[0].text).not.toContain(secret);
+          expect(event.messages[0].content[0].text).toContain("***REDACTED:");
+        }
+      });
+
+      it("Fences cannot span text blocks or messages", async () => {
+        const { hooks } = await loadV2(testOverrides);
+        const split = [textBlock(`\`\`\`noredact\n${secret}`), textBlock(`${secret}\n\`\`\``)];
+        for (const messages of [
+          [{ role: "user", content: structuredClone(split) }],
+          split.map((block) => ({ role: "user", content: [structuredClone(block)] })),
+        ]) {
+          const event = { system: [], messages };
+          await hooks[name](event);
+          for (const message of event.messages) {
+            for (const block of message.content) expect(block.text).not.toContain(secret);
+          }
+        }
+      });
+
+      it("Non-user roles receive no fence exemption", async () => {
+        const { hooks } = await loadV2(testOverrides);
+        const roles = ["system", "assistant", "tool", "unknown", undefined, "User", null, 1];
+        const event = {
+          system: [textBlock(fenced)],
+          messages: roles.map((role) => ({ ...(role === undefined ? {} : { role }), content: [textBlock(fenced)] })),
+        };
+        await hooks[name](event);
+        expect(event.system[0].text).not.toContain(secret);
+        for (const message of event.messages) {
+          expect(message.content[0].text).not.toContain(secret);
+          expect(message.content[0].text).toContain("***REDACTED:");
+        }
+      });
+
+      it("User-role exemption does not require human-authorship metadata", async () => {
+        const { hooks } = await loadV2(testOverrides);
+        const texts = [fenced, `File contents:\n${fenced}`, `<conversation-checkpoint>\n<summary>\n${fenced}\n</summary>\n</conversation-checkpoint>`];
+        const event = { system: [], messages: texts.map((text) => ({ role: "user", content: [textBlock(text)] })) };
+        await hooks[name](event);
+        expect(event.messages.map((message) => message.content[0].text)).toEqual(texts);
+      });
+
+      it("User-role rescan failures retain fail-open behavior", async () => {
+        const { hooks } = await loadV2({
+          ...testOverrides,
+          _createLinterOverride: () => async () => { throw new Error("scanner unavailable"); },
+        });
+        const text = `${fenced}\noutside=${secondSecret}`;
+        const event = userEvent(textBlock(text));
+        await expect(hooks[name](event)).resolves.toBeUndefined();
+        expect(event.messages[0].content[0].text).toBe(text);
+      });
+    });
+  }
+
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it("noredact fences in tool output do not exempt secrets from redaction", async () => {
+    const { hooks } = await loadV2(testOverrides);
+    const event = { tool: "shell", status: "completed", result: { content: [textBlock(fenced)] } };
+    await hooks["execute.after"](event);
+    expect(event.result.content[0].text).not.toContain(secret);
+    expect(event.result.content[0].text).toContain("***REDACTED:");
+  });
 });
 
 describe("lifecycle", () => {
