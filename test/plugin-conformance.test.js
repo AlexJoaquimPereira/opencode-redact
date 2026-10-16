@@ -507,47 +507,66 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       });
     });
 
-    it(`${name}: redacts the derived payload while a persisted-history snapshot stays unchanged`, async () => {
-      // Comment-2 coverage: what the hook mutates is the host's per-request
-      // DERIVED payload only. A snapshot standing in for the persisted record
-      // (the host re-derives a fresh payload each provider call — traced in
-      // docs/v2-compat-audit.md) keeps its raw secrets.
+    it(`${name}: a tool-call/tool-result-only redaction has no text part to annotate`, async () => {
+      // Ownership + annotation coverage (review comment 2, and the spec's
+      // "No text-bearing part to carry the annotation" scenario): when every
+      // redaction lands in a part with no `.text`, the payload is still
+      // redacted, but no annotation is appended because no text-bearing part
+      // exists to carry it. The genuine copy-on-write guarantees are pinned
+      // by the deep-frozen-parts and untouched-originals tests below.
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
-      const reasoningPart = { type: "reasoning", text: `think ${secret}` };
       const event = {
         sessionID: "s1",
-        system: [{ type: "text", text: `leak ${secret}` }],
+        system: [],
         messages: [
           {
             role: "assistant",
             content: [
               { type: "tool-call", id: "1", name: "bash", input: { cmd: `echo ${secret}` } },
-              reasoningPart,
+              {
+                type: "tool-result",
+                id: "1",
+                name: "bash",
+                result: { type: "json", value: { out: `leak ${secret}` } },
+              },
             ],
           },
         ],
       };
-      const persisted = structuredClone(event);
       await hooks[name](event);
-      // Provider-bound payload: redacted (except the reasoning exemption).
-      expect(event.system[0].text).toContain("***REDACTED:");
-      expect(event.system[0].text).not.toContain(secret);
-      expect(event.messages[0].content[0].input.cmd).toContain("***REDACTED:");
-      expect(event.messages[0].content[0].input.cmd).not.toContain(secret);
-      // Reasoning part: exempt, keeps its secret.
-      expect(event.messages[0].content[1]).toBe(reasoningPart);
-      expect(reasoningPart.text).toBe(`think ${secret}`);
-      // Persisted record: untouched, secrets intact.
-      expect(JSON.stringify(persisted)).not.toContain("***REDACTED:");
-      expect(JSON.stringify(persisted)).toContain(secret);
+      const content = event.messages[0].content;
+      expect(content[0].input.cmd).toContain("***REDACTED:");
+      expect(content[0].input.cmd).not.toContain(secret);
+      expect(content[1].result.value.out).toContain("***REDACTED:");
+      expect(content[1].result.value.out).not.toContain(secret);
+      // No text-bearing part exists, so no annotation is appended anywhere.
+      expect(JSON.stringify(content)).not.toContain("[opencode-redact]");
+    });
+
+    it(`${name}: annotates a compaction redaction (a text-bearing part)`, async () => {
+      // The note goes on the last redacted part that carries a string `.text`,
+      // which now also covers a `compaction` summary (previously text-only).
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const event = {
+        sessionID: "s1",
+        system: [],
+        messages: [{ role: "assistant", content: [{ type: "compaction", text: `summary ${secret}` }] }],
+      };
+      await hooks[name](event);
+      const part = event.messages[0].content[0];
+      expect(part.text).toContain("***REDACTED:");
+      expect(part.text).not.toContain(secret);
+      expect(part.text).toContain("[opencode-redact]");
     });
 
     it(`${name}: writes only fresh array slots — deep-frozen part objects are never modified`, async () => {
-      // Copy-on-write contract: array slots are replaced; no part object and
-      // no nested container is ever written in place. Freezing every part
-      // recursively makes any in-place write throw (strict mode), failing
-      // the test loudly instead of asserting the negative.
+      // The real copy-on-write pin for the review's ownership request: array
+      // slots are replaced, but no part object and no nested container is
+      // ever written in place. Freezing every part recursively makes any
+      // in-place write throw (strict mode), failing the test loudly instead
+      // of asserting the negative.
       const deepFreeze = (value) => {
         if (value && typeof value === "object" && !Object.isFrozen(value)) {
           Object.freeze(value);

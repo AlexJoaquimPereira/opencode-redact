@@ -50,7 +50,7 @@ intent — **no secret reaches the model unprotected**:
   the secret through are all invalid. Redaction of signed reasoning is
   deferred to a follow-up change with a provider-compatible policy and a
   tool-use/replay regression test (see README "Known limitations").
-- **Session-hook rewardful mutation is copy-on-write, in a derived
+- **Session-hook request-bound mutation is copy-on-write, in a derived
   payload.** The hook handler replaces array slots only (verified by
   deep-frozen-part, identity, and untouched-original tests). The host
   derives the hook-bound `system`/`messages` fresh per provider call and

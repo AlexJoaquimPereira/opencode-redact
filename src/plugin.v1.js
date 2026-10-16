@@ -35,7 +35,13 @@ async function redactValueInPlace(value, lint, budget) {
       const next = await scanLeaf(item);
       if (next !== undefined) {
         try {
-          v[key] = next;
+          // A `__proto__` key must be written as data, not assigned — plain
+          // assignment would be ignored (string) or rewrite the prototype.
+          if (key === "__proto__") {
+            Object.defineProperty(v, key, { value: next, enumerable: true, writable: true, configurable: true });
+          } else {
+            v[key] = next;
+          }
           total += 1;
         } catch {
           // read-only field; skip

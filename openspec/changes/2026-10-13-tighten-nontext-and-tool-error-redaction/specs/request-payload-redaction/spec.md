@@ -36,3 +36,57 @@ unmodified.
 - **THEN** the part is left completely unmodified — its text keeps the
   detected secret and its `providerMetadata` is unchanged — and no
   annotation is added
+
+### Requirement: Annotate On Redaction, Once Per Assembled Container
+The system SHALL append a note when a redaction occurred in an assembled
+system prompt or in a message's content, instructing that a redaction
+placeholder must never be written back to a file, command, or message, and
+SHALL append exactly one such note per container (the system prompt as a
+whole; each message independently) even when multiple segments within that
+same container were redacted. The note SHALL be appended to the last
+redacted part in the container that carries model-facing text (a string
+`.text`); when a container's redactions all occur in parts with no `.text`
+(a `tool-call` part's `input`, a `tool-result` part's `value`), no note can
+be appended because no text-bearing part exists to carry it — the redaction
+SHALL still be counted and reported.
+
+#### Scenario: One annotation for multiple redactions in the system prompt
+- **WHEN** redactions occur in more than one system prompt segment for the
+  same request
+- **THEN** exactly one annotation is appended, reporting the combined count
+  and rule identifiers across every affected segment
+
+#### Scenario: No annotation when no redaction occurred
+- **WHEN** no secret is found in the assembled system prompt or a message's
+  content
+- **THEN** no annotation is appended
+
+#### Scenario: No text-bearing part to carry the annotation
+- **WHEN** a message's only redactions are in `tool-call` inputs or
+  `tool-result` values, so no redacted part carries a `.text`
+- **THEN** the redaction is counted and reported, and no annotation is
+  appended because no text-bearing part exists to carry it
+
+### Requirement: Cover Every Request-Assembly Point Independently
+The system SHALL apply system-prompt and message-history redaction whenever
+a request payload is assembled or re-derived for a provider call — including
+the primary agent loop's request, a one-shot auxiliary generation request
+issued by any installed component, a conversation-compaction request, and
+the auxiliary title-generation request — so that no such assembly point can
+bypass this redaction.
+
+#### Scenario: An auxiliary one-shot generation request is redacted
+- **WHEN** a one-shot generation request is issued with system or message
+  content containing a detectable secret, independent of the primary agent
+  loop
+- **THEN** that secret is redacted before the request is sent
+
+#### Scenario: A compaction request is redacted
+- **WHEN** a conversation-compaction request re-derives system or message
+  content containing a detectable secret
+- **THEN** that secret is redacted before the request is sent
+
+#### Scenario: A title-generation request is redacted
+- **WHEN** a title-generation request carries system or message content
+  containing a detectable secret
+- **THEN** that secret is redacted before the request is sent

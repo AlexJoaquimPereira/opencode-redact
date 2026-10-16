@@ -126,7 +126,19 @@ async function redactObjectStrings(value, { lint }, budget) {
         continue; // throwing getter; fail-open
       }
       const walked = await redactObjectStrings(item, { lint }, budget);
-      walkedObject[key] = walked.value;
+      // A `__proto__` key (a real own property, e.g. from JSON.parse) must be
+      // copied as data, not assigned — plain assignment would rewrite the
+      // clone's prototype instead of setting the property.
+      if (key === "__proto__") {
+        Object.defineProperty(walkedObject, key, {
+          value: walked.value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      } else {
+        walkedObject[key] = walked.value;
+      }
       if (walked.redactionCount > 0) {
         changed = true;
         totalCount += walked.redactionCount;
@@ -327,8 +339,9 @@ async function redactContentPart(part, { lint, honorNoRedact = false }) {
     case "effort":
       return { part, count: 0, ruleIds: [] };
     default:
-      // Unknown future variant: best-effort scan a string `.text`.
-      return redactTextField(part, "text", { lint });
+      // Unknown future variant: best-effort scan a string `.text`, honoring a
+      // user-role `noredact` fence exactly as a `text` part would.
+      return redactTextField(part, "text", { lint, honorNoRedact });
   }
 }
 
@@ -462,7 +475,7 @@ async function redactToolResult(result, { lint }) {
 async function redactContentArray(blocks, { lint, honorNoRedact = false }) {
   let total = 0;
   const ruleIdSet = new Set();
-  let lastTextIndex = -1;
+  let lastAnnotatableIndex = -1;
 
   for (let i = 0; i < blocks.length; i += 1) {
     const redacted = await redactContentPart(blocks[i], { lint, honorNoRedact });
@@ -470,10 +483,12 @@ async function redactContentArray(blocks, { lint, honorNoRedact = false }) {
       blocks[i] = redacted.part;
       total += redacted.count;
       for (const ruleId of redacted.ruleIds) ruleIdSet.add(ruleId);
-      // Annotate only `type:"text"` parts (system prompt + message text):
-      // injecting the tool-output-worded note into reasoning/compaction
-      // content would be semantically wrong.
-      if (redacted.part?.type === "text" && typeof redacted.part.text === "string") lastTextIndex = i;
+      // Annotate the last redacted part that carries model-facing text (a
+      // `text` block, a `compaction` summary, or any future text-bearing
+      // variant). Parts with no `.text` (tool-call inputs, tool-result
+      // values) cannot carry the note; a container whose redactions are all
+      // there is still counted and logged, just without an annotation.
+      if (typeof redacted.part?.text === "string") lastAnnotatableIndex = i;
     }
   }
 
@@ -482,10 +497,10 @@ async function redactContentArray(blocks, { lint, honorNoRedact = false }) {
   }
 
   const sortedRuleIds = [...ruleIdSet].sort();
-  if (lastTextIndex >= 0) {
-    blocks[lastTextIndex] = {
-      ...blocks[lastTextIndex],
-      text: `${blocks[lastTextIndex].text}\n\n${buildAnnotation(total, sortedRuleIds)}`,
+  if (lastAnnotatableIndex >= 0) {
+    blocks[lastAnnotatableIndex] = {
+      ...blocks[lastAnnotatableIndex],
+      text: `${blocks[lastAnnotatableIndex].text}\n\n${buildAnnotation(total, sortedRuleIds)}`,
     };
   }
   return { redactionCount: total, ruleIds: sortedRuleIds };
@@ -493,13 +508,14 @@ async function redactContentArray(blocks, { lint, honorNoRedact = false }) {
 
 /**
  * Redacts the request payload assembled/re-derived for a provider call
- * (design.md D1-D3): shared by the `context`, `generate`, and `compaction`
- * session hooks, since all three extend `SessionContext`
+ * (design.md D1-D3): shared by the `context`, `generate`, `compaction`, and
+ * `title` session hooks, since all four extend `SessionContext`
  * (`{system: SystemPart[], messages: Message[], ...}`, both mutable).
  *
  * `event.system[]` elements always have the exact `{type:"text", text}`
- * shape `redactContentBlock` expects (verified: `SystemPart` is not a
- * union), so it is reused unchanged. `event.messages[].content[]` is a
+ * shape `redactTextField` scans (verified: `SystemPart` is not a union);
+ * they are scanned with no `noredact`-fence exemption, since the system
+ * prompt has no message role. `event.messages[].content[]` is a
  * six-member tagged union (`Message.content: ContentPart[]`); text,
  * compaction, tool-call, and tool-result parts are scanned (the latter two
  * deep-walked copy-on-write), while media and effort parts and provider-
@@ -517,7 +533,7 @@ async function redactContentArray(blocks, { lint, honorNoRedact = false }) {
  *
  * Annotation is aggregated once per container (D2: the whole `system[]`
  * array; D3: each message's own `content[]` independently) via
- * `redactTextBlockArray` -- the same aggregate-then-annotate-once shape
+ * `redactContentArray` -- the same aggregate-then-annotate-once shape
  * the archived design already applies to `Tool.Content[]`.
  */
 async function redactSessionContextHandler(event, { lint }, log) {

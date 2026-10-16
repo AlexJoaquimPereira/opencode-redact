@@ -288,6 +288,11 @@ Trace of what the host actually hands the session hooks (`context`,
   `redactObjectField` spread; `redactContentArray` replaces only array
   **slots**. No part object or shared nested object is ever written in
   place on this path (pinned by the deep-frozen-parts conformance test).
+- **All four assembly points share this shape.** The auxiliary
+  `title`-generation request is another session-request kind carrying the
+  same `SessionContext`; the plugin registers
+  `ctx.session.hook("title", ...)` with this same handler, so it is covered
+  by the trace above exactly like `context`/`generate`/`compaction`.
 
 Conclusion: a secret that hits a session hook lives in a payload built for
 this one provider call; replacing array slots can rewrite that payload but
