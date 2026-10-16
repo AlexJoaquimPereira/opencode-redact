@@ -506,6 +506,104 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       });
     });
 
+    it(`${name}: redacts the derived payload while a persisted-history snapshot stays unchanged`, async () => {
+      // Comment-2 coverage: what the hook mutates is the host's per-request
+      // DERIVED payload only. A snapshot standing in for the persisted record
+      // (the host re-derives a fresh payload each provider call — traced in
+      // docs/v2-compat-audit.md) keeps its raw secrets.
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const reasoningPart = { type: "reasoning", text: `think ${secret}` };
+      const event = {
+        sessionID: "s1",
+        system: [{ type: "text", text: `leak ${secret}` }],
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", id: "1", name: "bash", input: { cmd: `echo ${secret}` } },
+              reasoningPart,
+            ],
+          },
+        ],
+      };
+      const persisted = structuredClone(event);
+      await hooks[name](event);
+      // Provider-bound payload: redacted (except the reasoning exemption).
+      expect(event.system[0].text).toContain("***REDACTED:");
+      expect(event.system[0].text).not.toContain(secret);
+      expect(event.messages[0].content[0].input.cmd).toContain("***REDACTED:");
+      expect(event.messages[0].content[0].input.cmd).not.toContain(secret);
+      // Reasoning part: exempt, keeps its secret.
+      expect(event.messages[0].content[1]).toBe(reasoningPart);
+      expect(reasoningPart.text).toBe(`think ${secret}`);
+      // Persisted record: untouched, secrets intact.
+      expect(JSON.stringify(persisted)).not.toContain("***REDACTED:");
+      expect(JSON.stringify(persisted)).toContain(secret);
+    });
+
+    it(`${name}: writes only fresh array slots — deep-frozen part objects are never modified`, async () => {
+      // Copy-on-write contract: array slots are replaced; no part object and
+      // no nested container is ever written in place. Freezing every part
+      // recursively makes any in-place write throw (strict mode), failing
+      // the test loudly instead of asserting the negative.
+      const deepFreeze = (value) => {
+        if (value && typeof value === "object" && !Object.isFrozen(value)) {
+          Object.freeze(value);
+          for (const key of Object.getOwnPropertyNames(value)) deepFreeze(value[key]);
+        }
+        return value;
+      };
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const systemSeg = deepFreeze({ type: "text", text: `sys ${secret}` });
+      const textPart = deepFreeze({ type: "text", text: `msg ${secret}` });
+      const callPart = deepFreeze({ type: "tool-call", id: "1", name: "bash", input: { cmd: `echo ${secret}` } });
+      const resultPart = deepFreeze({
+        type: "tool-result",
+        id: "1",
+        name: "bash",
+        result: { type: "json", value: { out: `leak ${secret}` } },
+      });
+      const event = {
+        sessionID: "s1",
+        system: [systemSeg],
+        messages: [{ role: "assistant", content: [textPart, callPart, resultPart] }],
+      };
+      await expect(hooks[name](event)).resolves.toBeUndefined();
+      expect(JSON.stringify(event)).toContain("***REDACTED:");
+      expect(JSON.stringify(event)).not.toContain(secret);
+    });
+
+    it(`${name}: replaced slots leave the original part objects untouched`, async () => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const textPart = { type: "text", text: `msg ${secret}` };
+      const callPart = { type: "tool-call", id: "1", name: "bash", input: { cmd: `echo ${secret}` } };
+      const resultPart = {
+        type: "tool-result",
+        id: "1",
+        name: "bash",
+        result: { type: "json", value: { out: `leak ${secret}` } },
+      };
+      const untouchedText = { type: "text", text: "nothing sensitive here" };
+      const event = {
+        sessionID: "s1",
+        system: [],
+        messages: [{ role: "assistant", content: [textPart, callPart, resultPart, untouchedText] }],
+      };
+      await hooks[name](event);
+      const content = event.messages[0].content;
+      expect(content[0]).not.toBe(textPart);
+      expect(content[1]).not.toBe(callPart);
+      expect(content[2]).not.toBe(resultPart);
+      expect(content[3]).toBe(untouchedText);
+      // The ORIGINAL inputs the host still holds keep their raw values.
+      expect(textPart.text).toBe(`msg ${secret}`);
+      expect(callPart.input.cmd).toBe(`echo ${secret}`);
+      expect(resultPart.result.value.out).toBe(`leak ${secret}`);
+    });
+
     it(`${name}: leaves media and effort parts untouched`, async () => {
       const { hooks } = await loadV2();
       const mediaPart = {
