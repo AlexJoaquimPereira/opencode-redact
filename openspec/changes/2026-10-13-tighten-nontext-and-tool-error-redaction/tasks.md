@@ -7,7 +7,9 @@
 ## 2. Non-text message history
 
 - [x] Deep-scan `tool-call.input` and `tool-result.result.value`
-- [x] Scan `reasoning`/`compaction` `.text`; leave `media`/`effort` untouched
+- [x] Scan `compaction` `.text`; leave `media`/`effort` untouched
+- [x] Exempt provider-signed `reasoning` parts (post-review; keep text +
+      `providerMetadata` intact — see "Post-review adjustments")
 - [x] Scan only `type:"text"` parts for the model-facing annotation
 - [x] Tests across all request-assembly hooks
 

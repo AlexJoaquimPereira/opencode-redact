@@ -418,6 +418,32 @@ rm ~/.config/opencode/plugins/opencode-redact.js
   same way it always has. A password built entirely from the 10 included
   symbols plus letters and digits is unaffected.
 
+## History and request ownership
+
+Every path this plugin writes is either a provider-bound payload or a record
+the host explicitly surfaces through a hook — and it is deliberately one or
+the other, never both by accident:
+
+- **Session hooks (`context` / `generate` / `compaction`).** The host
+  derives the hook-bound `system`/`messages` fresh on every provider call
+  and consumes the hook's result only for the outgoing request; the
+  session's persisted message history is re-derived from storage on the
+  next call and is not reachable through the hook event. The handler
+  therefore replaces array *slots* copy-on-write: no part object or shared
+  nested object is written in place (pinned by deep-frozen-parts,
+  identity, and untouched-original tests in
+  `test/plugin-conformance.test.js`). The full trace against v2.0.26
+  source is in `docs/v2-compat-audit.md`, "Update — 2026-10-14".
+- **`tool.execute.after`.** By upstream hook semantics (V1 parity), the
+  object this hook receives backs the tool's visible result (and, for an
+  error, the execution's `Tool.Error` the host persists). Redacting it
+  therefore rewrites both the provider-bound payload and the tool record —
+  intended: the placeholder the provider sees is the one the record keeps,
+  and the plugin's annotation tells any later reader why.
+- **Provider-signed reasoning is untouched on every path.** See
+  "Known limitations" above; scanning it requires a provider-compatible
+  confidentiality policy and is tracked as a follow-up.
+
 ## Development
 
 ```bash

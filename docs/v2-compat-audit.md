@@ -231,3 +231,80 @@ archived) for the full design record and delta specs.
 - A working v2 install is a one-line shim in `.opencode/plugins/` that
   re-exports `opencode-redact/v2` (or a local `src/plugin.v2.js`); see the
   README "Install" section.
+
+## Update — 2026-10-14 (content-part tightening, signed-reasoning exemption, and request-history ownership)
+
+A maintainer review of the `fix/tool-error-and-contentpart-redaction` PR
+raised two questions: whether redacting a `reasoning` part is protocol-safe,
+and whether the session-hook handler's array-slot mutation (`blocks[i] =
+redacted.part`) can rewrite the session's persisted message history. Both
+are answered here against opencode v2.0.26 source (`sst/opencode` tag
+`v2.0.26`, release commit `9b4ec57`; `packages/core/...`).
+
+### Signed reasoning is exempt — provider SDKs reject modified thinking
+
+A `reasoning` part carries `providerMetadata` proof-of-generation scoped to
+the model that produced it (Anthropic message/thinking signature, Gemini
+thought signatures, OpenAI encrypted reasoning). The tightened handler no
+longer scans `reasoning` parts at all: Anthropic and AWS Bedrock reject a
+request whose thinking blocks were modified after generation, so an edited
+text with an unchanged signature is invalid state — and passing the secret
+through (or dropping the protocol metadata) is not a substitute. Redacting
+signed reasoning is deferred until a provider-compatible confidentiality
+policy exists, with a tool-use/replay regression test; see the README's
+"Known limitations" entry.
+
+### Hook-bound history is a per-request derivation, not the persisted record
+
+Trace of what the host actually hands the session hooks (`context`,
+`generate`, `compaction`) and what it keeps:
+
+- **Per-request assembly.** `packages/core/src/session/model-request.ts`
+  `baseTranscript` (:100-120) builds the transcript **fresh on every
+  provider call**: `system` is a new array of `SystemPart.make(...)`;
+  `messages` comes from `toLLMMessages(...)` (`.runner/llm.ts` re-derives
+  after each `context.load` — "retries refresh context", `llm.ts:215`,
+  called per step at `llm.ts:224-230`). History entries are pulled from
+  session storage each load (`context.ts:176` maps DB-queried entries).
+- **Fresh objects per message.** `to-llm-message.ts` `toLLMMessage`
+  (:253-334) constructs entirely new `Message` objects from projected
+  `SessionMessage.Info` fields; the assistant branch (:153-233) builds new
+  part objects — and only attaches reasoning `providerMetadata` when the
+  part was produced by the same model without error/interruption,
+  degrading otherwise.
+- **What the hook receives.** `model-request.ts:420-428` passes session
+  hooks a fresh wrapper `{...draft, agent, tools}` whose `system`/`messages`
+  reference the draft; the hook's result (trigger has no cloning —
+  `plugin/hooks.ts:88-95` invokes callbacks with the same object) is
+  consumed **only** for the outgoing request (`:296-297`:
+  `system: shaped.system`,
+  `messages: boundImages(unsupportedParts(shaped.messages, ...))`).
+- **Why the plugin still copies.** Inner objects are not always fresh:
+  `toolInput()` (`to-llm-message.ts:86-88`) hands the stored
+  `tool.state.input` object through by reference, and metadata objects may
+  be shared. The plugin's deep walk is strictly copy-on-write —
+  `redactObjectStrings` rebuilds only containers whose strings changed and
+  returns original references otherwise; `redactTextField`/
+  `redactObjectField` spread; `redactContentArray` replaces only array
+  **slots**. No part object or shared nested object is ever written in
+  place on this path (pinned by the deep-frozen-parts conformance test).
+
+Conclusion: a secret that hits a session hook lives in a payload built for
+this one provider call; replacing array slots can rewrite that payload but
+cannot reach the canonical stored session, and the plugin leaves the
+original part objects untouched. The conformance tests cover all three
+invariants (payload redacted vs. snapshot preserved, frozen parts never
+written, replaced slots leaving originals' raw values intact).
+
+### Scoped exception: `tool.execute.after` does rewrite its record
+
+The one hook whose mutation reaches a persisted record is
+`tool.execute.after`: for a **failed** tool call the hooked object **is**
+the execution's `Tool.Error` (`packages/core/src/tool.ts:103-156`),
+redacted in place (`redactValueInPlace`), and the same object later
+surfaces/persists in the tool's state; for a completed call, the hooked
+result's fields flow into what the tool returns. That is the hook's own
+upstream semantics (V1 parity), accepted as the intended design — noted
+here so the distinction with the session hooks is explicit.
+
+
