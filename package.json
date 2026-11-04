@@ -25,7 +25,7 @@
   },
   "dependencies": {
     "@secretlint/config-loader": "^13.0.5",
-    "@secretlint/core": "^13.0.5",
+    "@secretlint/core": "^13.0.7",
     "@secretlint/secretlint-rule-preset-recommend": "^13.0.5",
     "jsonc-parser": "^3.3.1",
     "xdg-basedir": "^5.1.0"
