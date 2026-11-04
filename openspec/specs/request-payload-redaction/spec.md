@@ -45,6 +45,14 @@ a provider-compatible confidentiality policy. Media parts
 (binary/base64/url/ref) and `effort` parts SHALL be left completely
 unmodified.
 
+Unknown future part types carrying a string `.text` SHALL receive the same
+role-specific text redaction as a `text` part. Absent or non-object tool
+result values SHALL remain unchanged.
+
+#### Scenario: Unknown text-bearing parts retain role-specific fences
+- **WHEN** a future part type carries text with a detectable secret inside and outside a well-formed fence
+- **THEN** only an exactly user-role message retains the fenced secret, and the secret outside the fence is redacted
+
 #### Scenario: Redacts a secret in a message's text content
 - **WHEN** a message in a re-derived history payload has text content
   containing a detectable secret outside an exempt fence
@@ -99,6 +107,19 @@ unmodified.
 #### Scenario: User-role rescan failures retain fail-open behavior
 - **WHEN** scanning a non-exempt user-role text segment fails or times out
 - **THEN** that segment remains unchanged, valid fenced spans remain unchanged, and the hook resolves without an annotation for the failed scan
+
+#### Scenario: Structured history traversal uses observable bounds
+- **WHEN** a tool-call input or tool-result value contains a cycle, an excessively deep branch, or text beyond the structured scan budget
+- **THEN** traversal follows the bounds and payload-free warnings in "Handle Non-Scannable Output Gracefully", preserves skipped branches, and continues scanning independent siblings and messages
+
+#### Scenario: A malformed request container does not suppress later messages
+- **WHEN** processing a system prompt or one message's content throws
+- **THEN** the hook logs a payload-free error, resolves, and still redacts detectable secrets in later messages
+
+#### Scenario: Signed tool-call metadata and ordering are preserved
+- **WHEN** history contains a signed tool-call followed by an unsigned parallel sibling with detectable secrets in their arguments
+- **THEN** arguments are redacted while call identifiers, names, provider metadata, and ordering are unchanged
+- **AND** the original part objects and inputs remain unchanged
 
 ### Requirement: Cover Every Request-Assembly Point Independently
 The system SHALL apply system-prompt and message-history redaction whenever
