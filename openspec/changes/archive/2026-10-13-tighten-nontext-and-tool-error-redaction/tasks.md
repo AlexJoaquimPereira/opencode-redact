@@ -1,0 +1,12 @@
+- [x] Implement "Output of an unsuccessful tool invocation IS scanned" with host error identity preserved.
+- [x] Implement "Redacts a secret in a tool-call input or tool-result value" and "Signed reasoning is left untouched".
+- [x] Implement "No text-bearing part to carry the annotation" and compaction text annotations.
+- [x] Implement "A title-generation request is redacted".
+- [x] Add structured-output annotations, V1 metadata scanning, config-directory resolution, and preset-rule coverage.
+- [x] Implement "Cyclic and deep structured branches are skipped independently".
+- [x] Implement "An unusually large structured result does not block indefinitely" with observable skips.
+- [x] Implement "A malformed request container does not suppress later messages".
+- [x] Cover "Signed tool-call metadata and ordering are preserved".
+- [x] Update README and compatibility boundaries for the structured traversal scenarios.
+- [x] Implement "Shared graphs cannot exhaust traversal work" and budget string history inputs.
+- [x] Implement "Throwing properties do not suppress readable siblings" and cover "Unknown text-bearing parts retain role-specific fences".

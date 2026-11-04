@@ -27,17 +27,55 @@ segment unchanged.
   inserted
 
 ### Requirement: Redact Secrets In Re-Derived Message History
-The system SHALL scan text in re-derived message history for a provider request, replacing detected secrets except inside well-formed `noredact` fences in text blocks whose message role is exactly `user`. The exemption uses the existing user-message fence grammar independently per block, regardless of authorship or provenance. Non-text content remains unaffected.
+The system SHALL scan the text-bearing content of every message in a
+re-derived message-history payload assembled for a provider request and
+SHALL replace each detected secret substring with a redaction placeholder.
+This covers every `ContentPart` variant that carries model-bound text —
+`text` and `compaction` parts' `.text`, a `tool-call` part's `input`, and a
+`tool-result` part's `result.value` (its `json`/`text`/`error` variants and
+the text blocks of its `content` variant). Within a `text` block whose
+message role is exactly `user`, a well-formed `noredact` fence is exempt,
+using the existing user-message fence grammar independently per block,
+regardless of authorship or provenance. A `reasoning` part SHALL be left
+completely unmodified — including its text and `providerMetadata` — because
+its metadata certifies the text ("provider-signed reasoning") and provider
+SDKs (e.g. Anthropic, AWS Bedrock) reject requests whose thinking blocks
+were modified after generation; scanning it is deferred to a follow-up with
+a provider-compatible confidentiality policy. Media parts
+(binary/base64/url/ref) and `effort` parts SHALL be left completely
+unmodified.
+
+Unknown future part types carrying a string `.text` SHALL receive the same
+role-specific text redaction as a `text` part. Absent or non-object tool
+result values SHALL remain unchanged.
+Structured history follows the plain-object/array boundary in "Handle
+Non-Scannable Output Gracefully". Character and value-visit budgets are shared
+across every structured input and result value within one hook invocation.
+
+#### Scenario: Unknown text-bearing parts retain role-specific fences
+- **WHEN** a future part type carries text with a detectable secret inside and outside a well-formed fence
+- **THEN** only an exactly user-role message retains the fenced secret, and the secret outside the fence is redacted
 
 #### Scenario: Redacts a secret in a message's text content
 - **WHEN** a message in a re-derived history payload has text content
   containing a detectable secret outside an exempt fence
 - **THEN** that content's secret is replaced with a redaction placeholder
 
-#### Scenario: Non-text message content is left untouched
-- **WHEN** a message in a re-derived history payload contains content that
-  is not plain text (e.g. a tool call, a tool result, or reasoning content)
-- **THEN** that content is left completely unmodified
+#### Scenario: Redacts a secret in a tool-call input or tool-result value
+- **WHEN** a message in a re-derived history payload contains a `tool-call`
+  input or a `tool-result` value with a detectable secret
+- **THEN** that secret is replaced with a redaction placeholder
+
+#### Scenario: Media content is left untouched
+- **WHEN** a message in a re-derived history payload contains a `media` part
+- **THEN** that part is left completely unmodified
+
+#### Scenario: Signed reasoning is left untouched
+- **WHEN** a message in a re-derived history payload contains a `reasoning`
+  part that carries `providerMetadata` proof-of-generation
+- **THEN** the part is left completely unmodified — its text keeps the
+  detected secret and its `providerMetadata` is unchanged — and no
+  annotation is added
 
 #### Scenario: User-role fences survive each request-assembly stage
 - **WHEN** a primary, auxiliary generation, or compaction request contains a user-role text block with a well-formed `noredact` fence containing a detectable secret
@@ -73,12 +111,31 @@ The system SHALL scan text in re-derived message history for a provider request,
 - **WHEN** scanning a non-exempt user-role text segment fails or times out
 - **THEN** that segment remains unchanged, valid fenced spans remain unchanged, and the hook resolves without an annotation for the failed scan
 
+#### Scenario: Structured history traversal uses observable bounds
+- **WHEN** a tool-call input or tool-result value contains a cycle, an excessively deep branch, or text beyond the structured scan budget
+- **THEN** traversal follows the bounds and payload-free warnings in "Handle Non-Scannable Output Gracefully", preserves skipped branches, and continues scanning eligible independent siblings and messages while budget remains
+
+#### Scenario: Structured history budgets are shared across the request
+- **WHEN** earlier structured inputs or results exhaust the character or value-visit budget
+- **THEN** later structured parts remain unchanged and each skip reason is warned once for the hook invocation
+- **AND** a subsequent invocation starts with fresh budgets
+
+#### Scenario: A malformed request container does not suppress later messages
+- **WHEN** processing a system prompt or one message's content throws
+- **THEN** the hook logs a payload-free error, resolves, and still redacts detectable secrets in later messages
+
+#### Scenario: Signed tool-call metadata and ordering are preserved
+- **WHEN** history contains a signed tool-call followed by an unsigned parallel sibling with detectable secrets in their arguments
+- **THEN** arguments are redacted while call identifiers, names, provider metadata, and ordering are unchanged
+- **AND** the original part objects and inputs remain unchanged
+
 ### Requirement: Cover Every Request-Assembly Point Independently
 The system SHALL apply system-prompt and message-history redaction whenever
 a request payload is assembled or re-derived for a provider call — including
 the primary agent loop's request, a one-shot auxiliary generation request
-issued by any installed component, and a conversation-compaction request —
-so that no such assembly point can bypass this redaction.
+issued by any installed component, a conversation-compaction request, and
+the auxiliary title-generation request — so that no such assembly point can
+bypass this redaction.
 
 #### Scenario: An auxiliary one-shot generation request is redacted
 - **WHEN** a one-shot generation request is issued with system or message
@@ -91,13 +148,23 @@ so that no such assembly point can bypass this redaction.
   content containing a detectable secret
 - **THEN** that secret is redacted before the request is sent
 
+#### Scenario: A title-generation request is redacted
+- **WHEN** a title-generation request carries system or message content
+  containing a detectable secret
+- **THEN** that secret is redacted before the request is sent
+
 ### Requirement: Annotate On Redaction, Once Per Assembled Container
 The system SHALL append a note when a redaction occurred in an assembled
 system prompt or in a message's content, instructing that a redaction
 placeholder must never be written back to a file, command, or message, and
 SHALL append exactly one such note per container (the system prompt as a
 whole; each message independently) even when multiple segments within that
-same container were redacted.
+same container were redacted. The note SHALL be appended to the last
+redacted part in the container that carries model-facing text (a string
+`.text`); when a container's redactions all occur in parts with no `.text`
+(a `tool-call` part's `input`, a `tool-result` part's `value`), no note can
+be appended because no text-bearing part exists to carry it — the redaction
+SHALL still be counted and reported.
 
 #### Scenario: One annotation for multiple redactions in the system prompt
 - **WHEN** redactions occur in more than one system prompt segment for the
@@ -109,3 +176,9 @@ same container were redacted.
 - **WHEN** no secret is found in the assembled system prompt or a message's
   content
 - **THEN** no annotation is appended
+
+#### Scenario: No text-bearing part to carry the annotation
+- **WHEN** a message's only redactions are in `tool-call` inputs or
+  `tool-result` values, so no redacted part carries a `.text`
+- **THEN** the redaction is counted and reported, and no annotation is
+  appended because no text-bearing part exists to carry it

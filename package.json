@@ -1,7 +1,7 @@
 {
   "name": "opencode-redact",
   "version": "0.1.0",
-  "description": "opencode plugin that redacts secrets from tool output before it reaches the LLM.",
+  "description": "opencode plugin (V1 and V2) that redacts secrets from tool output, user messages, and assembled request payloads before they reach the LLM.",
   "type": "module",
   "main": "src/plugin.v1.js",
   "exports": {

@@ -25,48 +25,52 @@ import { redactSecrets, redactUserMessage, buildAnnotation, buildUserMessageAnno
 
 const PLUGIN_NAME = "opencode-redact";
 
-// D4 (design.md): total character budget for the recursive metadata walk,
-// shared across every string leaf scanned in one redactToolResult call.
-// Consistent with secretlint.js's per-scan DEFAULT_TIMEOUT_MS -- this is a
-// count/size cap, not a new timeout: each scanAndRedact call still races its
-// own per-call timeout unchanged; this only bounds how many such calls one
-// metadata walk can issue.
+// Per-traversal limits complement the scanner's per-call timeout.
 const METADATA_SCAN_BUDGET_CHARS = 200_000;
+const STRUCTURED_SCAN_MAX_DEPTH = 128;
+const STRUCTURED_SCAN_MAX_VISITS = 10_000;
 
 /** Returns a logger function; V2's Context.app has no log method (design.md D3), so this is stderr-only. */
 function makeLogger() {
   return (level, message) => {
-    process.stderr.write(`[${PLUGIN_NAME}] [${level}] ${message}\n`);
+    try {
+      process.stderr.write(`[${PLUGIN_NAME}] [${level}] ${message}\n`);
+    } catch { /* Diagnostics must not interrupt redaction. */ }
   };
 }
 
-/**
- * Redacts a single V2 `Tool.Content` block in place. Returns
- * `{content, redactionCount, ruleIds}` — `content` unchanged when nothing
- * was redacted or the block is not a `type:"text"` block (design.md D6c:
- * `type:"file"` blocks are URI references with no inline body, and are
- * left completely untouched).
- */
-async function redactContentBlock(block, { lint, honorNoRedact = false }) {
-  if (!block || block.type !== "text" || typeof block.text !== "string") {
-    return { block, redactionCount: 0, ruleIds: [] };
+function createScanState(log) {
+  return { remaining: METADATA_SCAN_BUDGET_CHARS, visits: STRUCTURED_SCAN_MAX_VISITS, ancestors: new WeakSet(), skipped: new Set(), log };
+}
+
+function warnSkipped(state, reason) {
+  if (state.skipped.has(reason)) return;
+  state.skipped.add(reason);
+  state.log("warn", `structured redaction skipped (${reason})`);
+}
+
+function visitValue(state) {
+  if (state.visits === 0) {
+    warnSkipped(state, "visits");
+    return false;
   }
-  const scanned = honorNoRedact
-    ? await redactUserMessage(block.text, { lint })
-    : await scanAndRedact(block.text, { lint });
-  if (scanned.redactionCount === 0) {
-    return { block, redactionCount: 0, ruleIds: [] };
+  state.visits -= 1;
+  return true;
+}
+
+function enterContainer(value, state, depth) {
+  const reason = state.ancestors.has(value) ? "cycle" : depth >= STRUCTURED_SCAN_MAX_DEPTH ? "depth" : null;
+  if (reason) {
+    warnSkipped(state, reason);
+    return false;
   }
-  return {
-    block: { ...block, text: scanned.text },
-    redactionCount: scanned.redactionCount,
-    ruleIds: scanned.ruleIds,
-  };
+  state.ancestors.add(value);
+  return true;
 }
 
 /**
  * Recursively walks an arbitrary JSON-like value, scanning and redacting
- * every string leaf via `scanAndRedact` (design.md D4). Rebuilds arrays and
+ * every string leaf within the traversal limits. Rebuilds arrays and
  * plain objects only when a descendant actually changed; returns the
  * original reference unchanged otherwise. Non-string, non-array,
  * non-object values (numbers, booleans, null, undefined) pass through
@@ -79,69 +83,259 @@ async function redactContentBlock(block, { lint, honorNoRedact = false }) {
  * plugin's existing scanner-error/timeout behavior -- and the walk
  * continues over the rest of the tree with whatever budget remains.
  *
- * Scoped to `Tool.Result.metadata` only (design.md D4's implementation-time
- * correction) -- `content` and `output` keep their existing, narrowly
- * targeted handling in `redactToolResult`.
+ * Cyclic back-edges and over-depth branches remain untouched. Tracking the
+ * current path, rather than all visited objects, lets shared siblings each
+ * receive their own redacted clone without mutating their common source.
  */
-async function redactObjectStrings(value, { lint }, budget) {
+async function redactObjectStrings(value, { lint }, budget, depth = 0) {
+  if (!visitValue(budget)) return { value, redactionCount: 0, ruleIds: [] };
   if (typeof value === "string") {
-    if (value.length === 0 || value.length > budget.remaining) {
+    const scanned = await scanLeaf(value, budget, lint);
+    return scanned
+      ? { value: scanned.text, redactionCount: scanned.redactionCount, ruleIds: scanned.ruleIds }
+      : { value, redactionCount: 0, ruleIds: [] };
+  }
+
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
       return { value, redactionCount: 0, ruleIds: [] };
     }
-    budget.remaining -= value.length;
-    const scanned = await scanAndRedact(value, { lint });
-    return { value: scanned.text, redactionCount: scanned.redactionCount, ruleIds: scanned.ruleIds };
   }
 
-  if (Array.isArray(value)) {
-    let changed = false;
+  if (!value || typeof value !== "object" || !enterContainer(value, budget, depth)) {
+    return { value, redactionCount: 0, ruleIds: [] };
+  }
+
+  try {
     let totalCount = 0;
     const ruleIdSet = new Set();
-    const items = [];
-    for (const item of value) {
-      const walked = await redactObjectStrings(item, { lint }, budget);
-      items.push(walked.value);
-      if (walked.redactionCount > 0) {
-        changed = true;
-        totalCount += walked.redactionCount;
-        for (const ruleId of walked.ruleIds) ruleIdSet.add(ruleId);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const key of Object.getOwnPropertyNames(descriptors)) {
+      if (Array.isArray(value) && key === "length") continue;
+      if (budget.visits === 0) {
+        warnSkipped(budget, "visits");
+        break;
       }
-    }
-    return { value: changed ? items : value, redactionCount: totalCount, ruleIds: [...ruleIdSet] };
-  }
-
-  if (value && typeof value === "object") {
-    let changed = false;
-    let totalCount = 0;
-    const ruleIdSet = new Set();
-    const walkedObject = {};
-    for (const key of Object.keys(value)) {
-      const walked = await redactObjectStrings(value[key], { lint }, budget);
-      walkedObject[key] = walked.value;
-      if (walked.redactionCount > 0) {
-        changed = true;
-        totalCount += walked.redactionCount;
-        for (const ruleId of walked.ruleIds) ruleIdSet.add(ruleId);
+      let item;
+      try {
+        item = value[key];
+      } catch {
+        visitValue(budget);
+        continue; // throwing getter; fail-open
       }
+      const walked = await redactObjectStrings(item, { lint }, budget, depth + 1);
+      const descriptor = descriptors[key];
+      if ("value" in descriptor) descriptor.value = walked.value;
+      else if (walked.redactionCount > 0) {
+        descriptors[key] = { value: walked.value, enumerable: descriptor.enumerable, configurable: descriptor.configurable, writable: true };
+      }
+      totalCount += walked.redactionCount;
+      for (const ruleId of walked.ruleIds) ruleIdSet.add(ruleId);
     }
-    return { value: changed ? walkedObject : value, redactionCount: totalCount, ruleIds: [...ruleIdSet] };
+    const clone = totalCount === 0 ? value : Array.isArray(value)
+      ? Object.defineProperties([], descriptors)
+      : Object.create(Object.getPrototypeOf(value), descriptors);
+    return { value: clone, redactionCount: totalCount, ruleIds: [...ruleIdSet] };
+  } finally {
+    budget.ancestors.delete(value);
   }
-
-  return { value, redactionCount: 0, ruleIds: [] };
 }
 
 /**
- * Redacts a V2 tool result (design.md D6): only `status === "completed"` is
- * ever scanned (D6a — a tool error's `error: Tool.Error` is left alone,
- * both because V1 never saw this branch either and because handling it
- * would require a runtime import of that schema class, reintroducing the
- * dependency D1 removes). Returns a NEW result object when anything was
- * redacted (`Tool.Result`'s fields are readonly), or the original `result`
- * reference unchanged otherwise.
+ * Scans a single string leaf against a shared budget. Returns the redacted
+ * scan result, or `undefined` when the value is not a string, is empty, exceeds the
+ * remaining budget, or has no finding. Fail-open, like the rest of the plugin.
  */
-async function redactToolResult(result, { lint }) {
+async function scanLeaf(text, budget, lint) {
+  if (typeof text !== "string" || text.length === 0) return undefined;
+  if (text.length > budget.remaining) {
+    warnSkipped(budget, "budget");
+    return undefined;
+  }
+  budget.remaining -= text.length;
+  const scanned = await scanAndRedact(text, { lint });
+  return scanned.redactionCount > 0 ? scanned : undefined;
+}
+
+/**
+ * Recursively redacts string leaves of an arbitrary value IN PLACE, preserving
+ * object identity and prototype. Used for host class instances (e.g. a tool
+ * error, a `Tool.Error` Schema.Class) where replacing the value with a plain
+ * clone could break the host. Read-only/frozen fields that throw on assignment
+ * are skipped (fail-open). Returns the number of leaves redacted.
+ */
+async function redactValueInPlace(value, { lint }, budget) {
+  let total = 0;
+  const walk = async (v, depth) => {
+    if (!visitValue(budget) || !v || typeof v !== "object" || !enterContainer(v, budget, depth)) return;
+    try {
+      for (const key of Object.getOwnPropertyNames(v)) {
+        if (Array.isArray(v) && key === "length") continue;
+        if (budget.visits === 0) {
+          warnSkipped(budget, "visits");
+          break;
+        }
+        let item;
+        try {
+          item = v[key];
+        } catch {
+          visitValue(budget);
+          continue; // throwing getter; fail-open
+        }
+        if (item && typeof item === "object") {
+          await walk(item, depth + 1);
+          continue;
+        }
+        if (!visitValue(budget)) break;
+        const scanned = await scanLeaf(item, budget, lint);
+        if (scanned) {
+          try {
+            v[key] = scanned.text;
+            total += 1;
+          } catch {
+            // Host fields can be read-only; preserve the host object.
+            continue;
+          }
+        }
+      }
+    } finally {
+      budget.ancestors.delete(v);
+    }
+  };
+  await walk(value, 0);
+  return total;
+}
+
+/** Deep-redacts an arbitrary JSON-like value, returning a new value + aggregate count. */
+async function redactDeepValue(value, { lint, log, budget = createScanState(log) }) {
+  const walked = await redactObjectStrings(value, { lint }, budget);
+  return { value: walked.value, count: walked.redactionCount, ruleIds: walked.ruleIds };
+}
+
+/** Redacts a string field of a plain object, returning a new object only when changed. */
+async function redactTextField(obj, key, { lint, honorNoRedact = false }) {
+  const current = obj?.[key];
+  if (typeof current !== "string" || current.length === 0) {
+    return { part: obj, count: 0, ruleIds: [] };
+  }
+  const scanned = honorNoRedact
+    ? await redactUserMessage(current, { lint })
+    : await scanAndRedact(current, { lint });
+  if (scanned.redactionCount === 0) {
+    return { part: obj, count: 0, ruleIds: [] };
+  }
+  return { part: { ...obj, [key]: scanned.text }, count: scanned.redactionCount, ruleIds: scanned.ruleIds };
+}
+
+/** Deep-redacts a maybe-string/maybe-object field of a plain object, returning a new object only when changed. */
+async function redactObjectField(obj, key, { lint, log, budget }) {
+  const current = obj?.[key];
+  if (current === undefined || current === null) {
+    return { part: obj, count: 0, ruleIds: [] };
+  }
+  if (typeof current !== "object" && typeof current !== "string") {
+    return { part: obj, count: 0, ruleIds: [] };
+  }
+  const r = await redactDeepValue(current, { lint, log, budget });
+  if (r.count === 0) {
+    return { part: obj, count: 0, ruleIds: [] };
+  }
+  return { part: { ...obj, [key]: r.value }, count: r.count, ruleIds: r.ruleIds };
+}
+
+/**
+ * Redacts a `ToolResultValue` union (`{type, value}`). For `type:"content"`
+ * only the inline `text` blocks are scanned (URI `file` blocks are left
+ * untouched); for `json`/`text`/`error` the whole `value` is deep-scanned
+ * (the `error` variant is how a tool failure reaches the model).
+ */
+async function redactResultValue(result, { lint, log, budget }) {
+  if (!result || typeof result !== "object") {
+    return { result, count: 0, ruleIds: [] };
+  }
+  if (result.type === "content" && Array.isArray(result.value)) {
+    let total = 0;
+    const ruleIdSet = new Set();
+    const blocks = [];
+    for (const block of result.value) {
+      if (block && block.type === "text" && typeof block.text === "string") {
+        const scanned = await scanAndRedact(block.text, { lint });
+        if (scanned.redactionCount > 0) {
+          blocks.push({ ...block, text: scanned.text });
+          total += scanned.redactionCount;
+          for (const id of scanned.ruleIds) ruleIdSet.add(id);
+          continue;
+        }
+      }
+      blocks.push(block);
+    }
+    if (total === 0) return { result, count: 0, ruleIds: [] };
+    return { result: { ...result, value: blocks }, count: total, ruleIds: [...ruleIdSet] };
+  }
+  const r = await redactDeepValue(result.value, { lint, log, budget });
+  if (r.count === 0) return { result, count: 0, ruleIds: [] };
+  return { result: { ...result, value: r.value }, count: r.count, ruleIds: r.ruleIds };
+}
+
+/**
+ * Redacts any one `ContentPart` variant, returning a new part only when
+ * changed. Media parts (binary/base64/url/ref) and effort parts are never
+ * touched; tool-call inputs and tool-result values are deep-scanned; text
+ * and compaction parts scan their `.text`; reasoning parts are left
+ * completely untouched (see the `case "reasoning"` note below).
+ *
+ * Note: redacting `tool-call.input` rewrites the model's own prior tool-call
+ * arguments in the replayed request payload. That is intentional for
+ * confidentiality, but it means the model sees a placeholder where it
+ * emitted a real value. Call identity, signature metadata and order are retained.
+ */
+async function redactContentPart(part, { lint, log, budget, honorNoRedact = false }) {
+  if (!part || typeof part !== "object") {
+    return { part, count: 0, ruleIds: [] };
+  }
+  switch (part.type) {
+    case "text":
+      return redactTextField(part, "text", { lint, honorNoRedact });
+    case "reasoning":
+      // Provider-signed: a reasoning part's providerMetadata carries proof of
+      // generation (Anthropic signature, Gemini thought signature, OpenAI
+      // encrypted content). Anthropic and AWS Bedrock reject requests whose
+      // thinking blocks were modified after generation, so scanning this
+      // part's text and returning an edited part while keeping the signature
+      // is invalid protocol state — the part is exempted entirely. Redacting
+      // signed reasoning is out of scope until a provider-compatible
+      // confidentiality policy exists (docs/v2-compat-audit.md).
+      return { part, count: 0, ruleIds: [] };
+    case "compaction":
+      if (typeof part.text !== "string") return { part, count: 0, ruleIds: [] };
+      return redactTextField(part, "text", { lint });
+    case "tool-call":
+      return redactObjectField(part, "input", { lint, log, budget });
+    case "tool-result": {
+      const r = await redactResultValue(part.result, { lint, log, budget });
+      if (r.count === 0) return { part, count: 0, ruleIds: [] };
+      return { part: { ...part, result: r.result }, count: r.count, ruleIds: r.ruleIds };
+    }
+    case "media":
+    case "effort":
+      return { part, count: 0, ruleIds: [] };
+    default:
+      // Unknown future variant: best-effort scan a string `.text`, honoring a
+      // user-role `noredact` fence exactly as a `text` part would.
+      return redactTextField(part, "text", { lint, honorNoRedact });
+  }
+}
+
+/**
+ * Redacts a completed V2 tool result by replacing changed fields on a new
+ * result object (`Tool.Result`'s fields are readonly). Tool errors use the
+ * separate in-place walker to retain host class identity and prototype.
+ */
+async function redactToolResult(result, { lint, log }) {
   let workingResult = result;
   let totalRedactionCount = 0;
+  let annotated = false;
   const ruleIdSet = new Set();
 
   if (typeof workingResult.content === "string") {
@@ -150,6 +344,7 @@ async function redactToolResult(result, { lint }) {
       workingResult = { ...workingResult, content: scanned.text };
       totalRedactionCount += scanned.redactionCount;
       for (const ruleId of scanned.ruleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   } else if (Array.isArray(workingResult.content)) {
     const blocks = [];
@@ -158,10 +353,12 @@ async function redactToolResult(result, { lint }) {
     let lastRedactedIndex = -1;
 
     for (const block of workingResult.content) {
-      const redacted = await redactContentBlock(block, { lint });
-      blocks.push(redacted.block);
-      if (redacted.redactionCount > 0) {
-        blockTotal += redacted.redactionCount;
+      const redacted = block?.type === "text"
+        ? await redactTextField(block, "text", { lint })
+        : { part: block, count: 0, ruleIds: [] };
+      blocks.push(redacted.part);
+      if (redacted.count > 0) {
+        blockTotal += redacted.count;
         for (const ruleId of redacted.ruleIds) blockRuleIds.add(ruleId);
         lastRedactedIndex = blocks.length - 1;
       }
@@ -177,27 +374,20 @@ async function redactToolResult(result, { lint }) {
       workingResult = { ...workingResult, content: blocks };
       totalRedactionCount += blockTotal;
       for (const ruleId of blockRuleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   } else if (typeof workingResult.content === "undefined" && typeof workingResult.output === "string") {
-    // design.md D6d: `content` absent entirely and `output` is a bare
-    // string -- the only shape the original design anticipated.
     const scanned = await redactSecrets(workingResult.output, { lint });
     if (scanned.redactionCount > 0) {
       workingResult = { ...workingResult, output: scanned.text };
       totalRedactionCount += scanned.redactionCount;
       for (const ruleId of scanned.ruleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   }
 
-  // Empirically confirmed against the real host (@opencode/cli 2.0.4): the
-  // built-in `shell` tool's `result.output` is NOT a bare string even when
-  // `result.content` IS present -- it is a structured
-  // `{exit, truncated, output: <same raw text as content>, status}` record.
-  // This is a duplicate carrier of the same text `content` already covers,
-  // not the "arbitrary programmatic data, never model-facing" case D6d's
-  // original bare-string branch above was written for. Redact this nested
-  // string field independently of whether `content` was already handled,
-  // so the same secret can never survive in this parallel field.
+  // The host's shell result duplicates content in a structured output.output
+  // field. Scan both carriers independently without rewriting other fields.
   if (
     workingResult.output &&
     typeof workingResult.output === "object" &&
@@ -206,19 +396,23 @@ async function redactToolResult(result, { lint }) {
   ) {
     const scanned = await scanAndRedact(workingResult.output.output, { lint });
     if (scanned.redactionCount > 0) {
-      workingResult = { ...workingResult, output: { ...workingResult.output, output: scanned.text } };
+      // When `content` was absent, this structured field is the only carrier
+      // of the redacted text, so attach the model-facing annotation here too —
+      // otherwise a redaction would occur with no note. When `content` was
+      // present it already carries the note, so the duplicate field stays bare.
+      const nextText = annotated
+        ? scanned.text
+        : `${scanned.text}\n\n${buildAnnotation(scanned.redactionCount, [...scanned.ruleIds].sort())}`;
+      workingResult = { ...workingResult, output: { ...workingResult.output, output: nextText } };
       totalRedactionCount += scanned.redactionCount;
       for (const ruleId of scanned.ruleIds) ruleIdSet.add(ruleId);
+      annotated = true;
     }
   }
 
-  // design.md D4: metadata is scanned unconditionally, independent of
-  // content/output handling above -- it had zero prior scanning behavior,
-  // so there is no existing test to regress here (unlike output, whose
-  // arbitrary-structured-data case must stay untouched -- see D4's
-  // implementation-time correction).
+  // Metadata is independent of the narrowly targeted output fields.
   if (workingResult.metadata && typeof workingResult.metadata === "object" && !Array.isArray(workingResult.metadata)) {
-    const budget = { remaining: METADATA_SCAN_BUDGET_CHARS };
+    const budget = createScanState(log);
     const walked = await redactObjectStrings(workingResult.metadata, { lint }, budget);
     if (walked.redactionCount > 0) {
       workingResult = { ...workingResult, metadata: walked.value };
@@ -234,25 +428,34 @@ async function redactToolResult(result, { lint }) {
 }
 
 /**
- * Walks an array of `{type:"text", text}`-shaped blocks, redacting each via
- * `redactContentBlock` and mutating the array in place. When anything was
- * redacted, exactly one `buildAnnotation` note is appended to the last
- * redacted block's `.text` (the aggregate-then-annotate-once shape shared
- * by `Tool.Content[]`, `event.system[]`, and each message's `content[]`).
- * Returns `{redactionCount, ruleIds}` for the caller's own logging.
+ * Redacts an array of ContentPart variants (text, reasoning, compaction,
+ * tool-call, tool-result, media, effort) by replacing changed slots via
+ * `redactContentPart` (copy-on-write; nothing is written in place and
+ * untouched parts keep their identity). When anything was redacted, exactly
+ * one `buildAnnotation` note is appended to the last redacted part that
+ * carries a string `.text` (text/compaction) — the aggregate-then-
+ * annotate-once shape shared by `Tool.Content[]`, `event.system[]`, and each
+ * message's `content[]`. Parts with no redacted text (tool-call/tool-result)
+ * are redacted without an annotation. Returns `{redactionCount, ruleIds}`
+ * for the caller's logging.
  */
-async function redactTextBlockArray(blocks, { lint, honorNoRedact = false }) {
+async function redactContentArray(blocks, { lint, log, budget, honorNoRedact = false }) {
   let total = 0;
   const ruleIdSet = new Set();
-  let lastRedactedIndex = -1;
+  let lastAnnotatableIndex = -1;
 
   for (let i = 0; i < blocks.length; i += 1) {
-    const redacted = await redactContentBlock(blocks[i], { lint, honorNoRedact });
-    if (redacted.redactionCount > 0) {
-      blocks[i] = redacted.block;
-      total += redacted.redactionCount;
+    const redacted = await redactContentPart(blocks[i], { lint, log, budget, honorNoRedact });
+    if (redacted.count > 0) {
+      blocks[i] = redacted.part;
+      total += redacted.count;
       for (const ruleId of redacted.ruleIds) ruleIdSet.add(ruleId);
-      lastRedactedIndex = i;
+      // Annotate the last redacted part that carries model-facing text (a
+      // `text` block, a `compaction` summary, or any future text-bearing
+      // variant). Parts with no `.text` (tool-call inputs, tool-result
+      // values) cannot carry the note; a container whose redactions are all
+      // there is still counted and logged, just without an annotation.
+      if (typeof redacted.part?.text === "string") lastAnnotatableIndex = i;
     }
   }
 
@@ -261,59 +464,57 @@ async function redactTextBlockArray(blocks, { lint, honorNoRedact = false }) {
   }
 
   const sortedRuleIds = [...ruleIdSet].sort();
-  blocks[lastRedactedIndex] = {
-    ...blocks[lastRedactedIndex],
-    text: `${blocks[lastRedactedIndex].text}\n\n${buildAnnotation(total, sortedRuleIds)}`,
-  };
+  if (lastAnnotatableIndex >= 0) {
+    blocks[lastAnnotatableIndex] = {
+      ...blocks[lastAnnotatableIndex],
+      text: `${blocks[lastAnnotatableIndex].text}\n\n${buildAnnotation(total, sortedRuleIds)}`,
+    };
+  }
   return { redactionCount: total, ruleIds: sortedRuleIds };
 }
 
 /**
- * Redacts the request payload assembled/re-derived for a provider call
- * (design.md D1-D3): shared by the `context`, `generate`, and `compaction`
- * session hooks, since all three extend `SessionContext`
- * (`{system: SystemPart[], messages: Message[], ...}`, both mutable).
- *
- * `event.system[]` elements always have the exact `{type:"text", text}`
- * shape `redactContentBlock` expects (verified: `SystemPart` is not a
- * union), so it is reused unchanged. `event.messages[].content[]` is a
- * six-member tagged union (`Message.content: ContentPart[]`); only
- * `type === "text"` blocks share that same shape and are redacted --
- * every other variant (media, tool-call, tool-result, reasoning,
- * compaction, effort) is left untouched (D3, mirrors the archived design's
- * D6c precedent of scanning only a verified-safe union member).
- *
- * Annotation is aggregated once per container (D2: the whole `system[]`
- * array; D3: each message's own `content[]` independently) via
- * `redactTextBlockArray` -- the same aggregate-then-annotate-once shape
- * the archived design already applies to `Tool.Content[]`.
+ * Scans derived provider requests without mutating shared history objects.
+ * Structured inputs/results share one budget across the hook invocation.
+ * User-role text alone honors fences; signed reasoning stays untouched.
+ * Each container fails independently and carries at most one annotation;
+ * tool-call inputs and tool-result values never carry annotations.
  */
 async function redactSessionContextHandler(event, { lint }, log) {
+  const budget = createScanState(log);
   try {
     if (Array.isArray(event.system) && event.system.length > 0) {
-      const { redactionCount, ruleIds } = await redactTextBlockArray(event.system, { lint });
+      const { redactionCount, ruleIds } = await redactContentArray(event.system, { lint, log, budget });
       if (redactionCount > 0) {
         log("warn", `redacted ${redactionCount} secret(s) in assembled system prompt (rules: ${ruleIds.join("+")})`);
       }
     }
 
-    if (Array.isArray(event.messages)) {
-      for (const message of event.messages) {
+  } catch {
+    log("error", "system-prompt redaction handler failed");
+  }
+
+  if (Array.isArray(event.messages)) {
+    for (const message of event.messages) {
+      try {
         if (!Array.isArray(message?.content) || message.content.length === 0) {
           continue;
         }
-        // User role is the exemption boundary, not proof of human authorship.
-        const { redactionCount, ruleIds } = await redactTextBlockArray(message.content, {
+        // User role is the exemption boundary, not proof of human authorship:
+        // a noredact fence in a user-role text block is exempt from rescan.
+        const { redactionCount, ruleIds } = await redactContentArray(message.content, {
           lint,
+          log,
+          budget,
           honorNoRedact: message.role === "user",
         });
         if (redactionCount > 0) {
           log("warn", `redacted ${redactionCount} secret(s) in a message's content (rules: ${ruleIds.join("+")})`);
         }
+      } catch {
+        log("error", "message-content redaction handler failed");
       }
     }
-  } catch (err) {
-    log("error", `session-context redaction handler failed: ${err?.message ?? err}`);
   }
 }
 
@@ -365,12 +566,25 @@ export default {
     const registrations = await Promise.all([
       ctx.tool.hook("execute.after", async (event) => {
         try {
-          if (event.status !== "completed") {
-            // design.md D6a: a tool error is never scanned here.
+          if (event.status === "error") {
+            // `Tool.Error` is a host Schema.Class, so redact its string leaves
+            // IN PLACE to preserve identity/prototype (a plain clone could
+            // break host serialization).
+            if (event.error && typeof event.error === "object") {
+              const budget = createScanState(log);
+              const count = await redactValueInPlace(event.error, { lint }, budget);
+              if (count > 0) {
+                log("warn", `redacted ${count} secret(s) in tool '${event.tool}' error`);
+              }
+            }
             return;
           }
 
-          const { result, redactionCount, ruleIds } = await redactToolResult(event.result, { lint });
+          if (event.status !== "completed") {
+            return;
+          }
+
+          const { result, redactionCount, ruleIds } = await redactToolResult(event.result, { lint, log });
           if (redactionCount === 0) {
             return;
           }
@@ -419,6 +633,11 @@ export default {
       ctx.session.hook("context", (event) => redactSessionContextHandler(event, { lint }, log)),
       ctx.session.hook("generate", (event) => redactSessionContextHandler(event, { lint }, log)),
       ctx.session.hook("compaction", (event) => redactSessionContextHandler(event, { lint }, log)),
+      // `SessionTitle` is a distinct auxiliary provider request
+      // (SessionRequestKind includes "title") carrying system[] + messages[],
+      // so it must be redacted independently — the context hook does not fire
+      // for it.
+      ctx.session.hook("title", (event) => redactSessionContextHandler(event, { lint }, log)),
     ]);
 
     return async () => {

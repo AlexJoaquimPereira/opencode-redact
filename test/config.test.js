@@ -36,6 +36,18 @@ describe("resolveConfigPath", () => {
       expect(resolved.endsWith(join("opencode", "redact.jsonc"))).toBe(true);
     }
   });
+
+  it("honors OPENCODE_CONFIG_DIR over the XDG location", () => {
+    const prev = process.env.OPENCODE_CONFIG_DIR;
+    const dir = join(tmpdir(), "oc-custom-cfg");
+    process.env.OPENCODE_CONFIG_DIR = dir;
+    try {
+      expect(resolveConfigPath()).toBe(join(dir, "redact.jsonc"));
+    } finally {
+      if (prev === undefined) delete process.env.OPENCODE_CONFIG_DIR;
+      else process.env.OPENCODE_CONFIG_DIR = prev;
+    }
+  });
 });
 
 describe("loadPluginConfig", () => {

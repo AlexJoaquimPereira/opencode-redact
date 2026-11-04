@@ -1,6 +1,66 @@
 import { createSecretlintConfig, createCompositeLinter } from "./secretlint.js";
 import { loadPluginConfig } from "./config.js";
-import { redactSecrets, redactUserMessage, buildUserMessageAnnotation } from "./redact.js";
+import { redactSecrets, redactUserMessage, buildUserMessageAnnotation, scanAndRedact } from "./redact.js";
+
+// Total character budget for one recursive metadata walk (parity with the V2
+// adapter's METADATA_SCAN_BUDGET_CHARS).
+const METADATA_SCAN_BUDGET_CHARS = 200_000;
+const STRUCTURED_SCAN_MAX_DEPTH = 128;
+
+/**
+ * Recursively redacts string leaves of an arbitrary value IN PLACE using
+ * `scanAndRedact`, preserving identity. Non-enumerable own fields are scanned
+ * (a host error's `message`/`stack` are non-enumerable). Read-only fields are
+ * skipped (fail-open). Returns the number of leaves redacted.
+ */
+async function redactValueInPlace(value, lint, budget, log) {
+  let total = 0;
+  const seen = new WeakSet();
+  const scanLeaf = async (text) => {
+    if (typeof text !== "string" || text.length === 0 || text.length > budget.remaining) return undefined;
+    budget.remaining -= text.length;
+    const scanned = await scanAndRedact(text, { lint });
+    return scanned.redactionCount > 0 ? scanned.text : undefined;
+  };
+  const walk = async (v, depth) => {
+    if (!v || typeof v !== "object" || seen.has(v)) return;
+    if (depth >= STRUCTURED_SCAN_MAX_DEPTH) {
+      if (!budget.depthSkipped) {
+        budget.depthSkipped = true;
+        await log("warn", "metadata redaction skipped (depth)");
+      }
+      return;
+    }
+    seen.add(v);
+    const keys = Array.isArray(v) ? v.map((_, i) => i) : Object.getOwnPropertyNames(v);
+    for (const key of keys) {
+      let item;
+      try {
+        item = v[key];
+      } catch {
+        continue;
+      }
+      const next = await scanLeaf(item);
+      if (next !== undefined) {
+        try {
+          // Define an own data property rather than invoking a prototype setter.
+          if (key === "__proto__") {
+            Object.defineProperty(v, key, { value: next, enumerable: true, writable: true, configurable: true });
+          } else {
+            v[key] = next;
+          }
+          total += 1;
+        } catch {
+          // read-only field; skip
+        }
+      } else if (item && typeof item === "object") {
+        await walk(item, depth + 1);
+      }
+    }
+  };
+  await walk(value, 0);
+  return total;
+}
 
 /**
  * opencode plugin that redacts secrets from tool output before it reaches
@@ -49,24 +109,33 @@ export default async function OpencodeRedact({ client }, testOverrides = {}) {
   return {
     "tool.execute.after": async (input, output) => {
       try {
-        const original = output.output;
-        if (typeof original !== "string" || original.length === 0) {
-          return;
+        const original = output?.output;
+        if (typeof original === "string" && original.length > 0) {
+          const { text, redactionCount, ruleIds } = await redactSecrets(original, { lint });
+          if (redactionCount > 0) {
+            output.output = text;
+            await logSafely(
+              client,
+              "warn",
+              `redacted ${redactionCount} secret(s) in tool '${input.tool}' output (rules: ${ruleIds.join("+")})`,
+            );
+          }
         }
+      } catch {
+        await logSafely(client, "error", "tool-output redaction handler failed");
+      }
 
-        const { text, redactionCount, ruleIds } = await redactSecrets(original, { lint });
-        if (redactionCount === 0) {
-          return;
+      try {
+        if (output && typeof output.metadata === "object" && output.metadata !== null) {
+          const budget = { remaining: METADATA_SCAN_BUDGET_CHARS };
+          const metaCount = await redactValueInPlace(output.metadata, lint, budget,
+            (level, message) => logSafely(client, level, message));
+          if (metaCount > 0) {
+            await logSafely(client, "warn", `redacted ${metaCount} secret(s) in tool '${input.tool}' metadata`);
+          }
         }
-
-        output.output = text;
-        await logSafely(
-          client,
-          "warn",
-          `redacted ${redactionCount} secret(s) in tool '${input.tool}' output (rules: ${ruleIds.join("+")})`,
-        );
-      } catch (err) {
-        await logSafely(client, "error", `redaction handler failed for tool '${input?.tool}': ${err?.message}`);
+      } catch {
+        await logSafely(client, "error", "tool-metadata redaction handler failed");
       }
     },
 
