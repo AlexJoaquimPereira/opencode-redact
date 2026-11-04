@@ -22,6 +22,9 @@ unmodified.
 Unknown future part types carrying a string `.text` SHALL receive the same
 role-specific text redaction as a `text` part. Absent or non-object tool
 result values SHALL remain unchanged.
+Structured history follows the plain-object/array boundary in "Handle
+Non-Scannable Output Gracefully". Character and value-visit budgets are shared
+across every structured input and result value within one hook invocation.
 
 #### Scenario: Unknown text-bearing parts retain role-specific fences
 - **WHEN** a future part type carries text with a detectable secret inside and outside a well-formed fence
@@ -84,7 +87,12 @@ result values SHALL remain unchanged.
 
 #### Scenario: Structured history traversal uses observable bounds
 - **WHEN** a tool-call input or tool-result value contains a cycle, an excessively deep branch, or text beyond the structured scan budget
-- **THEN** traversal follows the bounds and payload-free warnings in "Handle Non-Scannable Output Gracefully", preserves skipped branches, and continues scanning independent siblings and messages
+- **THEN** traversal follows the bounds and payload-free warnings in "Handle Non-Scannable Output Gracefully", preserves skipped branches, and continues scanning eligible independent siblings and messages while budget remains
+
+#### Scenario: Structured history budgets are shared across the request
+- **WHEN** earlier structured inputs or results exhaust the character or value-visit budget
+- **THEN** later structured parts remain unchanged and each skip reason is warned once for the hook invocation
+- **AND** a subsequent invocation starts with fresh budgets
 
 #### Scenario: A malformed request container does not suppress later messages
 - **WHEN** processing a system prompt or one message's content throws

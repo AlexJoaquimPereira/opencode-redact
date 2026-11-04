@@ -326,14 +326,22 @@ rm ~/.config/opencode/plugins/opencode-redact.js
   [AWS Bedrock — conversation inference](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
 - **Structured V2 scans are bounded and fail open.** Metadata, tool errors,
   and structured history inputs/results use a 200,000-character scan budget
-  per traversal, at most 10,000 value visits, and a maximum of 128 nested containers per path. Oversized
+  and at most 10,000 value visits per tool-result scan or request-hook invocation,
+  with a maximum of 128 nested containers per path. All structured history
+  inputs/results share the request budget. Oversized
   string leaves, cyclic back-edges, and deeper branches remain unscanned;
   secrets there can reach the provider. A payload-free warning reports each
-  skip reason once per traversal, while independent siblings remain eligible
+  skip reason once per tool-result scan or request-hook invocation, while independent siblings remain eligible
   for scanning until the visit budget is exhausted. String tool-call inputs
-  use the same budget. V1 metadata scanning does not provide these V2 depth,
-  visit, or skip-warning guarantees. Ordinary text blocks and duplicate tool-output strings are
+  use the same budget. V1 metadata scanning skips depth 128 with a warning
+  and runs independently of output failures, but has no visit cap.
+  Ordinary text blocks (including text blocks in history result-content values)
+  and duplicate tool-output strings are
   scanned separately, outside these structured limits.
+- **Non-plain structured objects are not cloned or scanned in V2.**
+  Copy-on-write traverses only plain objects and arrays. Date, Map, Error,
+  and other class instances remain untouched, including secrets in their
+  fields. Host execution errors are still redacted in place.
 - **Tool-call arguments are redacted during replay.** Call IDs, names,
   signature metadata, and ordering are preserved, including unsigned parallel
   siblings. This preserves the verified Gemini signature transport contract,

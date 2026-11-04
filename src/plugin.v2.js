@@ -69,30 +69,6 @@ function enterContainer(value, state, depth) {
 }
 
 /**
- * Redacts a single V2 `Tool.Content` block in place. Returns
- * `{content, redactionCount, ruleIds}` — `content` unchanged when nothing
- * was redacted or the block is not a `type:"text"` block (design.md D6c:
- * `type:"file"` blocks are URI references with no inline body, and are
- * left completely untouched).
- */
-async function redactContentBlock(block, { lint, honorNoRedact = false }) {
-  if (!block || block.type !== "text" || typeof block.text !== "string") {
-    return { block, redactionCount: 0, ruleIds: [] };
-  }
-  const scanned = honorNoRedact
-    ? await redactUserMessage(block.text, { lint })
-    : await scanAndRedact(block.text, { lint });
-  if (scanned.redactionCount === 0) {
-    return { block, redactionCount: 0, ruleIds: [] };
-  }
-  return {
-    block: { ...block, text: scanned.text },
-    redactionCount: scanned.redactionCount,
-    ruleIds: scanned.ruleIds,
-  };
-}
-
-/**
  * Recursively walks an arbitrary JSON-like value, scanning and redacting
  * every string leaf within the traversal limits. Rebuilds arrays and
  * plain objects only when a descendant actually changed; returns the
@@ -118,6 +94,13 @@ async function redactObjectStrings(value, { lint }, budget, depth = 0) {
     return scanned
       ? { value: scanned.text, redactionCount: scanned.redactionCount, ruleIds: scanned.ruleIds }
       : { value, redactionCount: 0, ruleIds: [] };
+  }
+
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { value, redactionCount: 0, ruleIds: [] };
+    }
   }
 
   if (!value || typeof value !== "object" || !enterContainer(value, budget, depth)) {
@@ -212,6 +195,7 @@ async function redactValueInPlace(value, { lint }, budget) {
             total += 1;
           } catch {
             // Host fields can be read-only; preserve the host object.
+            continue;
           }
         }
       }
@@ -224,8 +208,7 @@ async function redactValueInPlace(value, { lint }, budget) {
 }
 
 /** Deep-redacts an arbitrary JSON-like value, returning a new value + aggregate count. */
-async function redactDeepValue(value, { lint, log }) {
-  const budget = createScanState(log);
+async function redactDeepValue(value, { lint, log, budget = createScanState(log) }) {
   const walked = await redactObjectStrings(value, { lint }, budget);
   return { value: walked.value, count: walked.redactionCount, ruleIds: walked.ruleIds };
 }
@@ -246,7 +229,7 @@ async function redactTextField(obj, key, { lint, honorNoRedact = false }) {
 }
 
 /** Deep-redacts a maybe-string/maybe-object field of a plain object, returning a new object only when changed. */
-async function redactObjectField(obj, key, { lint, log }) {
+async function redactObjectField(obj, key, { lint, log, budget }) {
   const current = obj?.[key];
   if (current === undefined || current === null) {
     return { part: obj, count: 0, ruleIds: [] };
@@ -254,7 +237,7 @@ async function redactObjectField(obj, key, { lint, log }) {
   if (typeof current !== "object" && typeof current !== "string") {
     return { part: obj, count: 0, ruleIds: [] };
   }
-  const r = await redactDeepValue(current, { lint, log });
+  const r = await redactDeepValue(current, { lint, log, budget });
   if (r.count === 0) {
     return { part: obj, count: 0, ruleIds: [] };
   }
@@ -267,7 +250,7 @@ async function redactObjectField(obj, key, { lint, log }) {
  * untouched); for `json`/`text`/`error` the whole `value` is deep-scanned
  * (the `error` variant is how a tool failure reaches the model).
  */
-async function redactResultValue(result, { lint, log }) {
+async function redactResultValue(result, { lint, log, budget }) {
   if (!result || typeof result !== "object") {
     return { result, count: 0, ruleIds: [] };
   }
@@ -290,7 +273,7 @@ async function redactResultValue(result, { lint, log }) {
     if (total === 0) return { result, count: 0, ruleIds: [] };
     return { result: { ...result, value: blocks }, count: total, ruleIds: [...ruleIdSet] };
   }
-  const r = await redactDeepValue(result.value, { lint, log });
+  const r = await redactDeepValue(result.value, { lint, log, budget });
   if (r.count === 0) return { result, count: 0, ruleIds: [] };
   return { result: { ...result, value: r.value }, count: r.count, ruleIds: r.ruleIds };
 }
@@ -307,7 +290,7 @@ async function redactResultValue(result, { lint, log }) {
  * confidentiality, but it means the model sees a placeholder where it
  * emitted a real value. Call identity, signature metadata and order are retained.
  */
-async function redactContentPart(part, { lint, log, honorNoRedact = false }) {
+async function redactContentPart(part, { lint, log, budget, honorNoRedact = false }) {
   if (!part || typeof part !== "object") {
     return { part, count: 0, ruleIds: [] };
   }
@@ -328,9 +311,9 @@ async function redactContentPart(part, { lint, log, honorNoRedact = false }) {
       if (typeof part.text !== "string") return { part, count: 0, ruleIds: [] };
       return redactTextField(part, "text", { lint });
     case "tool-call":
-      return redactObjectField(part, "input", { lint, log });
+      return redactObjectField(part, "input", { lint, log, budget });
     case "tool-result": {
-      const r = await redactResultValue(part.result, { lint, log });
+      const r = await redactResultValue(part.result, { lint, log, budget });
       if (r.count === 0) return { part, count: 0, ruleIds: [] };
       return { part: { ...part, result: r.result }, count: r.count, ruleIds: r.ruleIds };
     }
@@ -370,10 +353,12 @@ async function redactToolResult(result, { lint, log }) {
     let lastRedactedIndex = -1;
 
     for (const block of workingResult.content) {
-      const redacted = await redactContentBlock(block, { lint });
-      blocks.push(redacted.block);
-      if (redacted.redactionCount > 0) {
-        blockTotal += redacted.redactionCount;
+      const redacted = block?.type === "text"
+        ? await redactTextField(block, "text", { lint })
+        : { part: block, count: 0, ruleIds: [] };
+      blocks.push(redacted.part);
+      if (redacted.count > 0) {
+        blockTotal += redacted.count;
         for (const ruleId of redacted.ruleIds) blockRuleIds.add(ruleId);
         lastRedactedIndex = blocks.length - 1;
       }
@@ -454,13 +439,13 @@ async function redactToolResult(result, { lint, log }) {
  * are redacted without an annotation. Returns `{redactionCount, ruleIds}`
  * for the caller's logging.
  */
-async function redactContentArray(blocks, { lint, log, honorNoRedact = false }) {
+async function redactContentArray(blocks, { lint, log, budget, honorNoRedact = false }) {
   let total = 0;
   const ruleIdSet = new Set();
   let lastAnnotatableIndex = -1;
 
   for (let i = 0; i < blocks.length; i += 1) {
-    const redacted = await redactContentPart(blocks[i], { lint, log, honorNoRedact });
+    const redacted = await redactContentPart(blocks[i], { lint, log, budget, honorNoRedact });
     if (redacted.count > 0) {
       blocks[i] = redacted.part;
       total += redacted.count;
@@ -489,39 +474,17 @@ async function redactContentArray(blocks, { lint, log, honorNoRedact = false }) 
 }
 
 /**
- * Redacts the request payload assembled/re-derived for a provider call
- * (design.md D1-D3): shared by the `context`, `generate`, `compaction`, and
- * `title` session hooks, since all four extend `SessionContext`
- * (`{system: SystemPart[], messages: Message[], ...}`, both mutable).
- *
- * `event.system[]` elements always have the exact `{type:"text", text}`
- * shape `redactTextField` scans (verified: `SystemPart` is not a union);
- * they are scanned with no `noredact`-fence exemption, since the system
- * prompt has no message role. `event.messages[].content[]` is a
- * seven-member tagged union (`Message.content: ContentPart[]`); text,
- * compaction, tool-call, and tool-result parts are scanned (the latter two
- * deep-walked copy-on-write), while media and effort parts and provider-
- * signed reasoning parts are left completely untouched: reasoning parts
- * carry providerMetadata proof-of-generation (Anthropic signature, Gemini
- * thought signature, OpenAI encrypted content) that loses validity if the
- * text is edited, and both Anthropic and AWS Bedrock reject modified
- * thinking blocks (D3, mirrors the archived design's D6c precedent of
- * scanning only verified-safe union members).
- *
- * Ownership: the host derives `system`/`messages` fresh per provider call
- * and consumes the hook-modified arrays only for the outgoing request —
- * array-slot replacement never reaches the session's persisted message
- * history (traced with file:line references in docs/v2-compat-audit.md).
- *
- * Annotation is aggregated once per container (D2: the whole `system[]`
- * array; D3: each message's own `content[]` independently) via
- * `redactContentArray` -- the same aggregate-then-annotate-once shape
- * the archived design already applies to `Tool.Content[]`.
+ * Scans derived provider requests without mutating shared history objects.
+ * Structured inputs/results share one budget across the hook invocation.
+ * User-role text alone honors fences; signed reasoning stays untouched.
+ * Each container fails independently and carries at most one annotation;
+ * tool-call inputs and tool-result values never carry annotations.
  */
 async function redactSessionContextHandler(event, { lint }, log) {
+  const budget = createScanState(log);
   try {
     if (Array.isArray(event.system) && event.system.length > 0) {
-      const { redactionCount, ruleIds } = await redactContentArray(event.system, { lint, log });
+      const { redactionCount, ruleIds } = await redactContentArray(event.system, { lint, log, budget });
       if (redactionCount > 0) {
         log("warn", `redacted ${redactionCount} secret(s) in assembled system prompt (rules: ${ruleIds.join("+")})`);
       }
@@ -542,6 +505,7 @@ async function redactSessionContextHandler(event, { lint }, log) {
         const { redactionCount, ruleIds } = await redactContentArray(message.content, {
           lint,
           log,
+          budget,
           honorNoRedact: message.role === "user",
         });
         if (redactionCount > 0) {

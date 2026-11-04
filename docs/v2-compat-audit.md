@@ -315,22 +315,30 @@ behavior. See [Google's thought-signature guide](https://ai.google.dev/gemini-ap
 ### Structured traversal boundaries
 
 V2 metadata, error objects, and structured history inputs/result values use
-a shared 200,000-character budget, at most 10,000 value visits per traversal,
+a shared 200,000-character budget, at most 10,000 value visits per tool-result
+scan or request-hook invocation,
 and a 128-container path limit. String tool-call inputs use the same budget.
 Cyclic back-edges, deeper branches, and leaves exceeding the remaining
 budget stay unchanged. Independent siblings continue, and each skip reason
-produces one payload-free warning per traversal. Tracking ancestors rather
+produces one payload-free warning per tool-result scan or request-hook invocation.
+All structured history inputs/results share that request budget. Tracking ancestors rather
 than all visited objects allows shared, acyclic inputs to be redacted at
 each occurrence without mutating their source. When the visit budget runs
 out, unvisited branches remain unchanged. Copy-on-write preserves own property
-descriptors, prototypes, throwing accessors, and sparse array holes; it creates
-request snapshots, not replacements for live host class instances.
+descriptors, throwing accessors, and sparse array holes on plain objects
+(including null-prototype records) and arrays. Other prototypes, including
+Date, Map, Error, and class instances, remain unchanged and unscanned;
+secrets in their fields can therefore pass through. Host execution errors
+still use the separate in-place path to retain identity.
 
-V1 metadata scanning provides the same secret detection but does not promise
-these V2 depth/visit bounds or skip warnings.
+V1 metadata scanning skips depth 128 with a payload-free warning and runs
+independently of output-scan failures. It does not provide the V2 visit cap.
 
 These are fail-open limits, not a guarantee that every secret is scanned.
-They do not bound ordinary text blocks or the targeted duplicate-output
+The prescreen only bypasses anchored preset rules; entropy scanning still
+runs for nonempty strings when enabled, so it is not a full clean-text bypass.
+These budgets do not bound ordinary text blocks (including text blocks in
+history result-content values) or the targeted duplicate-output
 field. A failed system or message container logs a payload-free error without
 preventing later messages from being scanned.
 

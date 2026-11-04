@@ -5,6 +5,7 @@ import { redactSecrets, redactUserMessage, buildUserMessageAnnotation, scanAndRe
 // Total character budget for one recursive metadata walk (parity with the V2
 // adapter's METADATA_SCAN_BUDGET_CHARS).
 const METADATA_SCAN_BUDGET_CHARS = 200_000;
+const STRUCTURED_SCAN_MAX_DEPTH = 128;
 
 /**
  * Recursively redacts string leaves of an arbitrary value IN PLACE using
@@ -12,7 +13,7 @@ const METADATA_SCAN_BUDGET_CHARS = 200_000;
  * (a host error's `message`/`stack` are non-enumerable). Read-only fields are
  * skipped (fail-open). Returns the number of leaves redacted.
  */
-async function redactValueInPlace(value, lint, budget) {
+async function redactValueInPlace(value, lint, budget, log) {
   let total = 0;
   const seen = new WeakSet();
   const scanLeaf = async (text) => {
@@ -21,8 +22,15 @@ async function redactValueInPlace(value, lint, budget) {
     const scanned = await scanAndRedact(text, { lint });
     return scanned.redactionCount > 0 ? scanned.text : undefined;
   };
-  const walk = async (v) => {
+  const walk = async (v, depth) => {
     if (!v || typeof v !== "object" || seen.has(v)) return;
+    if (depth >= STRUCTURED_SCAN_MAX_DEPTH) {
+      if (!budget.depthSkipped) {
+        budget.depthSkipped = true;
+        await log("warn", "metadata redaction skipped (depth)");
+      }
+      return;
+    }
     seen.add(v);
     const keys = Array.isArray(v) ? v.map((_, i) => i) : Object.getOwnPropertyNames(v);
     for (const key of keys) {
@@ -35,8 +43,7 @@ async function redactValueInPlace(value, lint, budget) {
       const next = await scanLeaf(item);
       if (next !== undefined) {
         try {
-          // A `__proto__` key must be written as data, not assigned — plain
-          // assignment would be ignored (string) or rewrite the prototype.
+          // Define an own data property rather than invoking a prototype setter.
           if (key === "__proto__") {
             Object.defineProperty(v, key, { value: next, enumerable: true, writable: true, configurable: true });
           } else {
@@ -47,11 +54,11 @@ async function redactValueInPlace(value, lint, budget) {
           // read-only field; skip
         }
       } else if (item && typeof item === "object") {
-        await walk(item);
+        await walk(item, depth + 1);
       }
     }
   };
-  await walk(value);
+  await walk(value, 0);
   return total;
 }
 
@@ -114,17 +121,21 @@ export default async function OpencodeRedact({ client }, testOverrides = {}) {
             );
           }
         }
+      } catch {
+        await logSafely(client, "error", "tool-output redaction handler failed");
+      }
 
-        // Parity with the V2 adapter: also scan the tool result's metadata.
+      try {
         if (output && typeof output.metadata === "object" && output.metadata !== null) {
           const budget = { remaining: METADATA_SCAN_BUDGET_CHARS };
-          const metaCount = await redactValueInPlace(output.metadata, lint, budget);
+          const metaCount = await redactValueInPlace(output.metadata, lint, budget,
+            (level, message) => logSafely(client, level, message));
           if (metaCount > 0) {
             await logSafely(client, "warn", `redacted ${metaCount} secret(s) in tool '${input.tool}' metadata`);
           }
         }
-      } catch (err) {
-        await logSafely(client, "error", `redaction handler failed for tool '${input?.tool}': ${err?.message}`);
+      } catch {
+        await logSafely(client, "error", "tool-metadata redaction handler failed");
       }
     },
 

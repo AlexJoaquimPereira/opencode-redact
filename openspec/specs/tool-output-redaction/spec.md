@@ -185,14 +185,19 @@ scan a tool invocation's error payload when that invocation did not complete
 successfully, preserving the host error's identity and prototype.
 Structured traversal of V2 metadata, errors, history inputs, and history
 result values, including string inputs, SHALL scan at most 200000 characters
-and visit at most 10000 values per traversal, entering at most 128 nested
+and visit at most 10000 values per tool-result scan or request-hook invocation, entering at most 128 nested
 containers along a path. A string exceeding the remaining
 budget, a cyclic back-edge, or a branch beyond the depth limit SHALL remain
 unmodified. Each distinct skip reason SHALL produce a payload-free warning
-once per traversal without preventing independent siblings from being scanned.
+once per tool-result scan or request-hook invocation without preventing eligible independent siblings from being scanned.
 Exhausting the value-visit budget SHALL leave all remaining branches unchanged.
 Copy-on-write traversal SHALL preserve property descriptors, throwing accessors,
 and array holes while continuing to scan readable siblings.
+Copy-on-write traversal SHALL scan only plain objects (including null-prototype
+records) and arrays. Other prototypes SHALL remain untouched, including secrets
+in their own fields. Host execution errors SHALL still be scanned in place.
+V1 metadata scanning SHALL skip containers at depth 128, report that skip without
+payloads, and run independently of output-scan failures.
 These fail-open limits do not apply to ordinary text content blocks or
 the narrowly targeted duplicate-output string field.
 
@@ -236,3 +241,23 @@ the narrowly targeted duplicate-output string field.
 #### Scenario: Throwing properties do not suppress readable siblings
 - **WHEN** a structured value contains a throwing getter alongside a detectable secret
 - **THEN** the readable secret is redacted, the getter is retained, and copy-on-write preserves property descriptors and array holes
+
+#### Scenario: Non-plain structured values are left untouched
+- **WHEN** a copy-on-write traversal encounters a Date, Map, Error, or other class instance alongside a plain field containing a secret
+- **THEN** the instance is preserved by reference without scanning its fields, while the eligible plain field is redacted
+
+#### Scenario: V1 metadata depth skips preserve independent redactions
+- **WHEN** V1 metadata contains a branch reaching depth 128 alongside readable secret-bearing siblings
+- **THEN** the deep branch remains unchanged, the siblings are redacted and counted, and a payload-free depth warning is emitted
+
+#### Scenario: V1 metadata scanning is isolated from output failures
+- **WHEN** reading or processing V1 tool output fails and its metadata contains a detectable secret
+- **THEN** the metadata is still scanned and redacted, and errors are logged without payloads
+
+#### Scenario: V1 metadata redacts own prototype keys without changing prototypes
+- **WHEN** V1 metadata has an own `__proto__` string field containing a detectable secret
+- **THEN** that field is redacted while the metadata prototype and own-property status are preserved
+
+#### Scenario: Read-only host error fields are preserved while writable siblings are redacted
+- **WHEN** a host execution error has a read-only secret-bearing field alongside a writable secret-bearing field
+- **THEN** the writable field is redacted, the read-only field is preserved, and the original error is returned

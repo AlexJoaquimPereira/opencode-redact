@@ -104,6 +104,48 @@ const CORPUS = [
 ];
 
 describe("V1/V2 adapter conformance — tool-output redaction", () => {
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it("V1 metadata depth skips preserve independent redactions", async () => {
+    const { client, v1Hooks } = await loadV1();
+    const secret = RULE_FIXTURES[0].content;
+    let branch = { note: secret };
+    for (let i = 0; i < 128; i += 1) branch = { child: branch };
+    const leaf = branch;
+    const metadata = { before: secret, branch, after: secret };
+    await v1Hooks["tool.execute.after"]({ tool: "shell" }, { output: CLEAN_TEXT, metadata });
+    expect(metadata.before).toContain("***REDACTED:");
+    expect(metadata.after).toContain("***REDACTED:");
+    let deepest = leaf;
+    for (let i = 0; i < 128; i += 1) deepest = deepest.child;
+    expect(deepest.note).toBe(secret);
+    const logs = client.app.log.mock.calls.map(([entry]) => entry.body);
+    expect(logs.some((entry) => entry.level === "warn" && entry.message.includes("depth"))).toBe(true);
+    expect(logs.some((entry) => entry.message.includes("redacted 2"))).toBe(true);
+    expect(JSON.stringify(logs)).not.toContain(secret);
+  });
+
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it("V1 metadata scanning is isolated from output failures", async () => {
+    const { client, v1Hooks } = await loadV1();
+    const secret = RULE_FIXTURES[0].content;
+    const metadata = { note: secret };
+    const output = { get output() { throw new Error(secret); }, metadata };
+    await expect(v1Hooks["tool.execute.after"]({ tool: "shell" }, output)).resolves.toBeUndefined();
+    expect(metadata.note).toContain("***REDACTED:");
+    expect(JSON.stringify(client.app.log.mock.calls)).not.toContain(secret);
+  });
+
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it("V1 metadata redacts own prototype keys without changing prototypes", async () => {
+    const { v1Hooks } = await loadV1();
+    const secret = RULE_FIXTURES[0].content;
+    const metadata = JSON.parse(JSON.stringify({ ["__proto__"]: secret, nested: { note: secret } }));
+    await v1Hooks["tool.execute.after"]({ tool: "shell" }, { metadata });
+    expect(Object.getPrototypeOf(metadata)).toBe(Object.prototype);
+    expect(Object.hasOwn(metadata, "__proto__")).toBe(true);
+    expect(metadata.__proto__).toContain("***REDACTED:");
+    expect(metadata.nested.note).toContain("***REDACTED:");
+  });
   for (const fixture of CORPUS) {
     it(`${fixture.name}: redacted text and log content are identical across V1 and V2`, async () => {
       const { client, v1Hooks } = await loadV1();
@@ -214,7 +256,8 @@ describe("V1/V2 adapter conformance — user-message redaction", () => {
 });
 
 describe("V2-only shape-specific cases", () => {
-  it('execute.after: redacts a secret in a non-enumerable error message (Tool.Error shape)', async () => {
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it("Output of an unsuccessful tool invocation IS scanned", async () => {
     const { hooks } = await loadV2();
     const secret = RULE_FIXTURES[0].content;
     class ToolError extends Error {}
@@ -236,6 +279,36 @@ describe("V2-only shape-specific cases", () => {
     expect(event.error.metadata.note).toContain("***REDACTED:");
     expect(event.error.metadata.note).not.toContain(secret);
   });
+
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it("Read-only host error fields are preserved while writable siblings are redacted", async () => {
+    const { hooks } = await loadV2();
+    const secret = RULE_FIXTURES[0].content;
+    const error = {};
+    Object.defineProperty(error, "locked", { value: secret, writable: false });
+    error.note = secret;
+    const event = { tool: "shell", status: "error", error };
+    await hooks["execute.after"](event);
+    expect(event.error).toBe(error);
+    expect(error.locked).toBe(secret);
+    expect(error.note).toContain("***REDACTED:");
+  });
+
+  // spec: openspec/specs/tool-output-redaction/spec.md
+  it.each([() => new Date(0), () => new Map([["key", "value"]]), () => new Error("fixture")])(
+    "Non-plain structured values are left untouched", async (create) => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const instance = Object.assign(create(), { note: secret });
+      const metadata = { instance, note: secret };
+      const event = { tool: "shell", status: "completed", result: { metadata } };
+      await hooks["execute.after"](event);
+      expect(event.result.metadata.instance).toBe(instance);
+      expect(instance.note).toBe(secret);
+      expect(event.result.metadata.note).toContain("***REDACTED:");
+      expect(metadata.note).toBe(secret);
+    },
+  );
 
   it("execute.after: Content[] walk redacts text blocks, leaves file blocks untouched, one annotation on the last redacted block", async () => {
     const { hooks } = await loadV2();
@@ -445,6 +518,38 @@ describe("V2-only shape-specific cases", () => {
 // spec: openspec/specs/request-payload-redaction/spec.md
 describe("V2-only shape-specific cases — session context/generate/compaction hooks", () => {
   const HOOK_NAMES = ["context", "generate", "compaction", "title"];
+
+  // spec: openspec/specs/request-payload-redaction/spec.md
+  it("A title-generation request is redacted", async () => {
+    const { hooks } = await loadV2();
+    const secret = RULE_FIXTURES[0].content;
+    const event = { system: [{ type: "text", text: secret }], messages: [{ role: "user", content: [{ type: "text", text: secret }] }] };
+    await hooks.title(event);
+    expect(event.system[0].text).toContain("***REDACTED:");
+    expect(event.messages[0].content[0].text).toContain("***REDACTED:");
+    expect(JSON.stringify(event)).not.toContain(secret);
+  });
+
+  // spec: openspec/specs/request-payload-redaction/spec.md
+  it.each(["characters", "visits"])("Structured history budgets are shared across the request", async (limit) => {
+    const { hooks } = await loadV2();
+    const secret = RULE_FIXTURES[0].content;
+    const first = limit === "characters" ? "x".repeat(200_000) : Array(9999).fill(null);
+    const original = { type: "tool-result", result: { type: "json", value: { note: secret } } };
+    const event = { system: [], messages: [
+      { role: "assistant", content: [{ type: "tool-call", input: first }] },
+      { role: "tool", content: [original, { type: "tool-call", input: { note: secret } }] },
+    ] };
+    const { lines } = await captureStderr(() => hooks.context(event));
+    expect(event.messages[1].content[0]).toBe(original);
+    expect(original.result.value.note).toBe(secret);
+    const reason = limit === "characters" ? "budget" : "visits";
+    expect(lines.filter((line) => line.includes("skipped") && line.includes(reason))).toHaveLength(1);
+    expect(lines.join("")).not.toContain(secret);
+    const fresh = { system: [], messages: [{ role: "tool", content: [original] }] };
+    await hooks.context(fresh);
+    expect(fresh.messages[0].content[0].result.value.note).toContain("***REDACTED:");
+  });
 
   it("setup registers context, generate, and compaction session hooks", async () => {
     const { ctx } = await loadV2();
@@ -675,7 +780,8 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       expect(stored.message).not.toContain(secret);
     });
 
-    it(`${name}: leaves a reasoning part with its providerMetadata untouched (signed-reasoning exemption)`, async () => {
+    // spec: openspec/specs/request-payload-redaction/spec.md
+    it("Signed reasoning is left untouched", async () => {
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
       const reasoningPart = {
@@ -696,7 +802,8 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
       });
     });
 
-    it(`${name}: a tool-call/tool-result-only redaction has no text part to annotate`, async () => {
+    // spec: openspec/specs/request-payload-redaction/spec.md
+    it("No text-bearing part to carry the annotation", async () => {
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
       const event = {
