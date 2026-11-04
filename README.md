@@ -139,6 +139,20 @@ vendor, alongside (not instead of) the pattern-based rules.
     `sha1-`/`sha384-`/`sha512-` likewise) — this is specifically what keeps
     `npm install`'s own `package-lock.json` from tripping this plugin on
     every dependency.
+- **URLs, filesystem paths, and decimal numbers are not entropy-scored.**
+  This applies to both the generic and short-password checks. Complete
+  `scheme://` URLs (including userinfo, query, and fragment), anchored Linux
+  paths, and Windows drive, UNC, and dot/home-relative paths are exempt.
+  Numbers include signed integers, decimals, and scientific notation, both
+  standalone and assigned to an identifier with `=` or `:`. Numeric-looking
+  fragments inside other tokens are not exempt.
+  URL/path spans end at whitespace, quotes, backticks, or brackets; commas
+  and semicolons remain part of the span. Unanchored `name/file` strings
+  are not treated as filesystem paths.
+  **Trade-off:** opaque secrets inside exempt URLs or filenames, and secrets
+  consisting entirely of numeric values, are no longer caught by entropy alone.
+  Explicit secret-pattern rules still run,
+  and JWT signature detection remains active, including inside those spans.
 - **JWTs are handled specially.** A JWT's header and payload are not scored
   (they're expected to be readable claims, not secret material); its
   signature segment — the part that actually makes the token usable — is
@@ -287,17 +301,17 @@ opencode:
 rm ~/.config/opencode/plugins/opencode-redact.js
 ```
 
-## Known limitations (v1, documented — not oversights)
+## Known limitations
 
-- **Failed tool calls are not scanned.** `tool.execute.after` only fires
+- **V1 failed tool calls are not scanned.** `tool.execute.after` only fires
   after a tool call succeeds; error output (e.g. a command's stderr, a stack
   trace) can still carry a secret to the model unredacted.
 - **Truncated output can spill an unredacted secret to disk.** opencode
   truncates very large tool output to a managed on-disk retention path
   *before* this hook runs; redacting the in-context string does not redact
   that spill file.
-- **`output.attachments` is not scanned.** Tool-result `metadata` IS scanned
-  (a V1-parity fix in this plugin); `attachments` carries references/URLs,
+- **`output.attachments` is not scanned.** Tool-result `metadata` is scanned;
+  `attachments` carries references/URLs,
   not inline text, so it is left untouched by the redactor.
 - **Provider-signed reasoning is not redacted.** In the V2 session hooks, a
   `reasoning` part is left completely untouched — its text and its
@@ -310,6 +324,21 @@ rm ~/.config/opencode/plugins/opencode-redact.js
   a follow-up. Refs:
   [Anthropic — extended thinking](https://platform.claude.com/docs/en/build-with-claude/thinking),
   [AWS Bedrock — conversation inference](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
+- **Structured V2 scans are bounded and fail open.** Metadata, tool errors,
+  and structured history inputs/results use a 200,000-character scan budget
+  per traversal, at most 10,000 value visits, and a maximum of 128 nested containers per path. Oversized
+  string leaves, cyclic back-edges, and deeper branches remain unscanned;
+  secrets there can reach the provider. A payload-free warning reports each
+  skip reason once per traversal, while independent siblings remain eligible
+  for scanning until the visit budget is exhausted. String tool-call inputs
+  use the same budget. V1 metadata scanning does not provide these V2 depth,
+  visit, or skip-warning guarantees. Ordinary text blocks and duplicate tool-output strings are
+  scanned separately, outside these structured limits.
+- **Tool-call arguments are redacted during replay.** Call IDs, names,
+  signature metadata, and ordering are preserved, including unsigned parallel
+  siblings. This preserves the verified Gemini signature transport contract,
+  but is not a live-provider replay certification or proof that signatures
+  cannot bind argument bytes; see `docs/v2-compat-audit.md`.
 - **The GCP p12 (binary) check never fires.** The GCP rule only runs when
   the scanned content's extension is `.json` or `.p12`; this plugin detects
   JSON-shaped text automatically and scans it as `.json`, but `.p12` is a
@@ -433,16 +462,16 @@ Every path this plugin writes is either a provider-bound payload or a record
 the host explicitly surfaces through a hook — and it is deliberately one or
 the other, never both by accident:
 
-- **Session hooks (`context` / `generate` / `compaction`).** The host
+- **Session hooks (`context` / `generate` / `compaction` / `title`).** The host
   derives the hook-bound `system`/`messages` fresh on every provider call
   and consumes the hook's result only for the outgoing request; the
   session's persisted message history is re-derived from storage on the
-  next call and is not reachable through the hook event. The handler
+  next call. Nested tool inputs can still share stored objects. The handler
   therefore replaces array *slots* copy-on-write: no part object or shared
   nested object is written in place (pinned by deep-frozen-parts,
   identity, and untouched-original tests in
   `test/plugin-conformance.test.js`). The full trace against v2.0.26
-  source is in `docs/v2-compat-audit.md`, "Update — 2026-10-14".
+  source is in `docs/v2-compat-audit.md`, "V2 content-part and ownership contracts".
 - **`tool.execute.after`.** By upstream hook semantics (V1 parity), the
   object this hook receives backs the tool's visible result (and, for an
   error, the execution's `Tool.Error` the host persists). Redacting it

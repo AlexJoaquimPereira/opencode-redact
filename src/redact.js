@@ -3,8 +3,8 @@
 // scanner. See design.md D1.
 
 // Structural delimiter characters that stop expansion the same way
-// whitespace does. Verified (see openspec/changes/narrow-token-boundary-expansion
-// /proposal.md "Verified safety invariant") to never appear inside any
+// whitespace does. See openspec/specs/tool-output-redaction/spec.md for
+// the boundary contract. These never appear inside any
 // secret shape this plugin can detect:
 //   - this plugin's own entropy candidate charsets (CANDIDATE_RUN_PATTERN,
 //     PASSWORD_CANDIDATE_PATTERN in entropy-rule.js) exclude all of these

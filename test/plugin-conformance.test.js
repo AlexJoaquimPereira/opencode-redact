@@ -1,12 +1,12 @@
-// spec: openspec/changes/v2-plugin-migration/specs/tool-output-redaction/spec.md
-// spec: openspec/changes/v2-plugin-migration/specs/user-message-redaction/spec.md
+// spec: openspec/specs/tool-output-redaction/spec.md
+// spec: openspec/specs/user-message-redaction/spec.md
 //
 // Layer-2 adapter-conformance suite (design.md D9): drives a shared fixture
 // corpus through a fake V1 host and a fake V2 ctx, asserting the two
 // adapters produce string-identical redacted text, identical annotations,
 // and identical log content — the property that stops the two adapters
 // drifting apart. V2-only shape-specific cases (Content[] walk, tool-error
-// skip, output fallback), lifecycle, and invariant cases follow.
+// redaction, output fallback), lifecycle, and invariant cases follow.
 import { describe, it, expect, vi } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -81,6 +81,18 @@ async function captureStderr(fn) {
 }
 
 const CLEAN_TEXT = "nothing sensitive at all";
+const STRUCTURED_BRANCHES = [
+  { reason: "cycle", create: () => { const branch = []; branch.push(branch); return branch; } },
+  {
+    reason: "depth",
+    create: (secret) => {
+      let branch = { note: secret };
+      for (let i = 0; i < 128; i += 1) branch = { child: branch };
+      return branch;
+    },
+  },
+  { reason: "budget", create: (secret) => `${"x".repeat(200_000)}${secret}` },
+];
 const CORPUS = [
   { name: "clean", text: CLEAN_TEXT, expectRedaction: false },
   // Exclude "gcp": it requires ext:".json" context (see test/fixtures.js's
@@ -205,7 +217,8 @@ describe("V2-only shape-specific cases", () => {
   it('execute.after: redacts a secret in a non-enumerable error message (Tool.Error shape)', async () => {
     const { hooks } = await loadV2();
     const secret = RULE_FIXTURES[0].content;
-    const error = { metadata: { note: `meta ${secret}` } };
+    class ToolError extends Error {}
+    const error = Object.assign(new ToolError("tool failed"), { metadata: { note: `meta ${secret}` } });
     // Host `Tool.Error.message`/`.stack` are non-enumerable own properties;
     // simulate that so a regression back to `Object.keys` fails here.
     Object.defineProperty(error, "message", {
@@ -216,6 +229,8 @@ describe("V2-only shape-specific cases", () => {
     });
     const event = { tool: "bash", status: "error", error };
     await hooks["execute.after"](event);
+    expect(event.error).toBe(error);
+    expect(Object.getPrototypeOf(event.error)).toBe(ToolError.prototype);
     expect(event.error.message).toContain("***REDACTED:");
     expect(event.error.message).not.toContain(secret);
     expect(event.error.metadata.note).toContain("***REDACTED:");
@@ -350,21 +365,81 @@ describe("V2-only shape-specific cases", () => {
     expect(event.result.content).toBe("clean text");
   });
 
-  it("execute.after: an unusually large structured result does not block indefinitely", async () => {
+  it.each(["completed", "error", "history"])("Shared graphs cannot exhaust traversal work (%s)", async (status) => {
     const { hooks } = await loadV2();
     const secret = RULE_FIXTURES[0].content;
-    const bigClean = "x".repeat(250_000);
-    const originalResult = Object.freeze({
-      content: "clean text",
-      metadata: { blob: bigClean, note: `leak=${secret}` },
-    });
-    const event = { tool: "bash", status: "completed", result: originalResult };
-    const start = Date.now();
-    await hooks["execute.after"](event);
-    expect(Date.now() - start).toBeLessThan(5000);
-    // The budget may leave the tail unscanned; the result must not hang or throw.
-    expect(typeof event.result.metadata.blob).toBe("string");
+    let graph = {};
+    for (let i = 0; i < 14; i += 1) graph = { left: graph, right: graph };
+    const value = { note: secret, graph };
+    const event = status === "history"
+      ? { system: [], messages: [{ role: "assistant", content: [{ type: "tool-call", input: value }] }] }
+      : { tool: "shell", status, error: value, result: { metadata: value } };
+    const { lines } = await captureStderr(() => hooks[status === "history" ? "context" : "execute.after"](event));
+    const scanned = status === "history" ? event.messages[0].content[0].input
+      : status === "error" ? event.error : event.result.metadata;
+    expect(scanned.note).toContain("***REDACTED:");
+    expect(scanned.graph).toBe(graph);
+    expect(lines.filter((line) => line.includes("skipped") && line.includes("visits"))).toHaveLength(1);
+    expect(lines.join("")).not.toContain(secret);
   });
+
+  it.each(["completed", "error"])("Throwing properties do not suppress readable siblings (%s)", async (status) => {
+    const { hooks } = await loadV2();
+    const secret = RULE_FIXTURES[0].content;
+    const getter = () => { throw new Error(secret); };
+    const sparse = [, secret];
+    const value = { sparse };
+    Object.defineProperty(value, "unreadable", { get: getter, enumerable: true });
+    Object.defineProperty(value, "note", { value: secret, enumerable: false, writable: true });
+    const event = { tool: "shell", status, error: value, result: { metadata: value } };
+    const { lines } = await captureStderr(() => hooks["execute.after"](event));
+    const scanned = status === "error" ? event.error : event.result.metadata;
+    expect(scanned.note).toContain("***REDACTED:");
+    expect(scanned.sparse[1]).toContain("***REDACTED:");
+    expect(Object.getOwnPropertyDescriptor(scanned, "unreadable")).toMatchObject({ get: getter });
+    expect(Object.getOwnPropertyDescriptor(scanned, "note").enumerable).toBe(false);
+    expect(0 in scanned.sparse).toBe(false);
+    expect(lines.join("")).not.toContain(secret);
+    if (status === "completed") expect(value.note).toBe(secret);
+  });
+
+  it.each(["completed", "error"])("An unusually large structured result does not block indefinitely (%s)", async (status) => {
+    const { hooks } = await loadV2();
+    const secret = RULE_FIXTURES[0].content;
+    const blob = STRUCTURED_BRANCHES.find((entry) => entry.reason === "budget").create(secret);
+    const value = { blob, duplicate: blob, note: `leak=${secret}` };
+    const error = Object.assign(new Error("tool failed"), value);
+    const event = { tool: "bash", status, error, result: { content: CLEAN_TEXT, metadata: value } };
+    const { lines } = await captureStderr(() => hooks["execute.after"](event));
+    const scanned = status === "error" ? event.error : event.result.metadata;
+    expect(scanned.blob).toBe(blob);
+    expect(scanned.duplicate).toBe(blob);
+    expect(scanned.note).toContain("***REDACTED:");
+    expect(scanned.note).not.toContain(secret);
+    expect(lines.filter((line) => line.includes("skipped") && line.includes("budget"))).toHaveLength(1);
+    expect(lines.join("")).not.toContain(secret);
+    if (status === "error") expect(event.error).toBe(error);
+  });
+
+  it.each(STRUCTURED_BRANCHES.filter((entry) => entry.reason !== "budget").flatMap((entry) =>
+    ["completed", "error"].map((status) => ({ ...entry, status }))))(
+    "Cyclic and deep structured branches are skipped independently ($reason, $status)", async ({ reason, create, status }) => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const branch = create(secret);
+      const value = { branch, note: `leak=${secret}` };
+      const error = Object.assign(new Error("tool failed"), value);
+      const event = { tool: "bash", status, error, result: { content: CLEAN_TEXT, metadata: value } };
+      const { lines } = await captureStderr(() => hooks["execute.after"](event));
+      const scanned = status === "error" ? event.error : event.result.metadata;
+      expect(scanned.branch).toBe(branch);
+      expect(scanned.note).toContain("***REDACTED:");
+      expect(scanned.note).not.toContain(secret);
+      expect(lines.filter((line) => line.includes("skipped") && line.includes(reason))).toHaveLength(1);
+      expect(lines.join("")).not.toContain(secret);
+      if (status === "error") expect(event.error).toBe(error);
+    },
+  );
 });
 
 // spec: openspec/specs/request-payload-redaction/spec.md
@@ -379,6 +454,120 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
   });
 
   for (const name of HOOK_NAMES) {
+    it.each([false, true])(`${name}: Structured history traversal uses observable bounds (string input, oversized=%s)`, async (oversized) => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const input = oversized ? "x".repeat(200_000) + secret : secret;
+      const original = { type: "tool-call", input };
+      const event = { system: [], messages: [{ role: "assistant", content: [original] }] };
+      const { lines } = await captureStderr(() => hooks[name](event));
+      const scanned = event.messages[0].content[0];
+      if (oversized) {
+        expect(scanned).toBe(original);
+        expect(lines.some((line) => line.includes("skipped") && line.includes("budget"))).toBe(true);
+      } else {
+        expect(scanned.input).toContain("***REDACTED:");
+        expect(scanned.input).not.toContain(secret);
+      }
+      expect(original.input).toBe(input);
+    });
+
+    it(`${name}: Redacts a secret in a tool-call input or tool-result value (content variant)`, async () => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const file = { type: "file", uri: "file:///tmp/fixture", mime: "text/plain" };
+      const original = { type: "tool-result", result: { type: "content", value: [{ type: "text", text: secret }, file] } };
+      const event = { system: [], messages: [{ role: "tool", content: [original] }] };
+      await hooks[name](event);
+      const scanned = event.messages[0].content[0];
+      expect(scanned.result.value[0].text).toContain("***REDACTED:");
+      expect(scanned.result.value[0].text).not.toContain(secret);
+      expect(scanned.result.value[1]).toBe(file);
+      expect(original.result.value[0].text).toBe(secret);
+    });
+
+    it.each(["user", "assistant"])(`${name}: Unknown text-bearing parts retain role-specific fences (%s)`, async (role) => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const original = { type: "future-text", text: `\`\`\`noredact\n${secret}\n\`\`\`\n${secret}` };
+      const event = { system: [], messages: [{ role, content: [original, { type: "tool-result", result: null }] }] };
+      await hooks[name](event);
+      const parts = event.messages[0].content;
+      expect(parts[0].text).toContain("***REDACTED:");
+      expect(parts[0].text.includes(secret)).toBe(role === "user");
+      expect(parts[1].result).toBeNull();
+      expect(original.text).toContain(secret);
+    });
+
+    it.each(STRUCTURED_BRANCHES.flatMap((entry) => ["tool-call", "tool-result"].map((type) => ({ ...entry, type }))))(
+      `${name}: Structured history traversal uses observable bounds ($reason, $type)`, async ({ reason, create, type }) => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const input = { branch: create(secret), duplicate: null, note: `leak=${secret}` };
+      input.duplicate = input.branch;
+      const event = {
+        system: [],
+        messages: [{ role: type === "tool-call" ? "assistant" : "tool", content: [
+          type === "tool-call"
+            ? { type, id: "1", name: "shell", input }
+            : { type, id: "1", name: "shell", result: { type: "json", value: input } },
+        ] }],
+      };
+      const { lines } = await captureStderr(() => hooks[name](event));
+      const part = event.messages[0].content[0];
+      const scanned = type === "tool-call" ? part.input : part.result.value;
+      expect(scanned.branch).toBe(input.branch);
+      expect(scanned.note).toContain("***REDACTED:");
+      expect(scanned.note).not.toContain(secret);
+      expect(input.note).toBe(`leak=${secret}`);
+      expect(lines.filter((line) => line.includes("skipped") && line.includes(reason))).toHaveLength(1);
+      expect(lines.join("")).not.toContain(secret);
+    });
+
+    it.each(["system", "message"])(`${name}: A malformed request container does not suppress later messages (%s)`, async (container) => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      const malformed = { type: "text", get text() { throw new Error(secret); } };
+      const event = {
+        system: container === "system" ? [malformed] : [],
+        messages: [
+          ...(container === "message" ? [{ role: "assistant", content: [malformed] }] : []),
+          { role: "user", content: [{ type: "text", text: `leak=${secret}` }] },
+        ],
+      };
+      const { lines } = await captureStderr(() => hooks[name](event));
+      expect(event.messages.at(-1).content[0].text).toContain("***REDACTED:");
+      expect(event.messages.at(-1).content[0].text).not.toContain(secret);
+      expect(lines.some((line) => line.includes("[error]"))).toBe(true);
+      expect(lines.join("")).not.toContain(secret);
+    });
+
+    it(`${name}: Signed tool-call metadata and ordering are preserved`, async () => {
+      const { hooks } = await loadV2();
+      const secret = RULE_FIXTURES[0].content;
+      // OpenCode 2.0.26's Gemini decoder stores each part's thoughtSignature
+      // in providerMetadata independently from functionCall.args -> input.
+      const providerMetadata = { google: { thoughtSignature: "signed-call-proof" } };
+      const signed = { type: "tool-call", id: "signed", name: "shell", input: { cmd: secret }, providerMetadata };
+      const sibling = { type: "tool-call", id: "parallel", name: "read", input: { path: secret } };
+      const originals = [signed, sibling];
+      const event = { system: [], messages: [{ role: "assistant", content: [...originals] }] };
+      await hooks[name](event);
+      const parts = event.messages[0].content;
+      expect(parts.map(({ id, name }) => ({ id, name }))).toEqual([
+        { id: "signed", name: "shell" }, { id: "parallel", name: "read" },
+      ]);
+      expect(parts[0].providerMetadata).toBe(providerMetadata);
+      expect(parts[0].providerMetadata.google.thoughtSignature).toBe("signed-call-proof");
+      expect(parts[1]).not.toHaveProperty("providerMetadata");
+      expect(parts[0].input.cmd).toContain("***REDACTED:");
+      expect(parts[1].input.path).toContain("***REDACTED:");
+      expect(signed.input.cmd).toBe(secret);
+      expect(sibling.input.path).toBe(secret);
+      expect(parts[0]).not.toBe(signed);
+      expect(parts[1]).not.toBe(sibling);
+    });
+
     it(`${name}: redacts a known-detectable secret in a system prompt segment`, async () => {
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
@@ -508,12 +697,6 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
     });
 
     it(`${name}: a tool-call/tool-result-only redaction has no text part to annotate`, async () => {
-      // Ownership + annotation coverage (review comment 2, and the spec's
-      // "No text-bearing part to carry the annotation" scenario): when every
-      // redaction lands in a part with no `.text`, the payload is still
-      // redacted, but no annotation is appended because no text-bearing part
-      // exists to carry it. The genuine copy-on-write guarantees are pinned
-      // by the deep-frozen-parts and untouched-originals tests below.
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
       const event = {
@@ -545,8 +728,6 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
     });
 
     it(`${name}: annotates a compaction redaction (a text-bearing part)`, async () => {
-      // The note goes on the last redacted part that carries a string `.text`,
-      // which now also covers a `compaction` summary (previously text-only).
       const { hooks } = await loadV2();
       const secret = RULE_FIXTURES[0].content;
       const event = {
@@ -562,11 +743,8 @@ describe("V2-only shape-specific cases — session context/generate/compaction h
     });
 
     it(`${name}: writes only fresh array slots — deep-frozen part objects are never modified`, async () => {
-      // The real copy-on-write pin for the review's ownership request: array
-      // slots are replaced, but no part object and no nested container is
-      // ever written in place. Freezing every part recursively makes any
-      // in-place write throw (strict mode), failing the test loudly instead
-      // of asserting the negative.
+      // Freezing shared parts turns any accidental in-place mutation into a
+      // strict-mode failure while allowing request-array slot replacement.
       const deepFreeze = (value) => {
         if (value && typeof value === "object" && !Object.isFrozen(value)) {
           Object.freeze(value);
@@ -681,7 +859,7 @@ describe("V2 user-role noredact request rescans", () => {
   const secret = RULE_FIXTURES.find((f) => f.rule === "aws").content;
   const secondSecret = RULE_FIXTURES.find((f) => f.rule === "privatekey").content;
   const fenced = `\`\`\`noredact\n${secret}\n\`\`\``;
-  const hookNames = ["context", "generate", "compaction"];
+  const hookNames = ["context", "generate", "compaction", "title"];
   // Keep annotation/count assertions independent of overlapping entropy findings.
   const testOverrides = { _loadPluginConfigOverride: async () => ({ disableHighEntropy: true }) };
   const textBlock = (text) => ({ type: "text", text });

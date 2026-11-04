@@ -22,12 +22,76 @@ import {
   creator,
 } from "../src/entropy-rule.js";
 import { ENTROPY_FIXTURES, SHORT_PASSWORD_FIXTURES, PATH_FIXTURES } from "./entropy-fixtures.js";
+import { createSecretlintConfig, createCompositeLinter } from "../src/secretlint.js";
+import { RULE_FIXTURES } from "./fixtures.js";
 
 const LOG2_36 = Math.log2(36); // 5.169925001442312
 const LOG2_26 = Math.log2(26); // 4.700439718141092
 const LOG2_16 = Math.log2(16); // 4.0
 const LOG2_4 = Math.log2(4); // 2.0
 const LOG2_8 = Math.log2(8); // 3.0
+
+describe("entropy exemption boundaries", () => {
+  const secret = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
+  const short = SHORT_PASSWORD_FIXTURES.find((fixture) => fixture.expectFinding).content;
+
+  it("Preserves integers decimals and scientific notation", () => {
+    for (const number of [
+      "01234567890123456789", "-98765432109876543210", "+98765432109876543210", "01234567890123456789.98765432109876543210",
+      "-.01234567890123456789", "+01234567890123456789.", "01234567890123456789e+98765432109876543210", "-01234567890123456789.5E-98765432109876543210",
+    ]) {
+      for (const text of [number, `value=${number}`, `value: ${number}`, `[${number}]`, `(${number}),`]) {
+        expect(findHighEntropyFindings(text), text).toEqual([]);
+      }
+    }
+  });
+
+  it("Does not exempt numeric fragments inside credentials", () => {
+    for (const text of [
+      `0123456789${secret}`, `${secret}0123456789`, `0123456789.${secret}`,
+      `0123456789e+${secret}`, `01234567890123456789.98765432109876543210.12345678901234567890`, `0123456789=${secret}`,
+    ]) {
+      expect(findHighEntropyFindings(text).length, text).toBeGreaterThan(0);
+    }
+  });
+
+  it("Detects secrets adjacent to exempt spans", () => {
+    for (const token of [secret, short]) {
+      for (const span of [`https://example.invalid/${token}`, `/${token}`, `C:\\${token}`]) {
+        for (const [open, close] of [["`", "`"], ["[", "]"], ["{", "}"], ["(", ")"], ["<", ">"], ['"', '"'], ["'", "'"], [" ", " "]]) {
+          const text = `${open}${span}${close}${token}`;
+          expect(findHighEntropyFindings(text), text).toEqual([
+            { start: text.length - token.length, end: text.length },
+          ]);
+        }
+      }
+    }
+  });
+
+  it("Detects outside fragments of candidates crossing exemption boundaries", () => {
+    for (const token of [secret, short]) {
+      const text = `${token}=https://example.invalid/${token}`;
+      // '=' belongs to the generic alphabet, but not the short-password alphabet.
+      const outside = token === secret ? `${token}=` : token;
+      expect(findHighEntropyFindings(text)).toEqual([{ start: 0, end: outside.length }]);
+    }
+  });
+
+  it("Keeps JWT signature detection active inside exempt spans", () => {
+    const jwt = `eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.${secret}`; // pragma: allowlist secret -- unsigned synthetic claims and generated signature
+    for (const text of [`https://example.invalid/${jwt}`, `/tmp/${jwt}`, `C:\\tmp\\${jwt}`]) {
+      const start = text.indexOf(secret);
+      expect(findHighEntropyFindings(text)).toEqual([{ start, end: start + secret.length }]);
+    }
+  });
+
+  it("Keeps explicit credential detection active inside exempt spans", async () => {
+    const lint = createCompositeLinter(await createSecretlintConfig());
+    const fixture = RULE_FIXTURES.find((entry) => entry.rule === "basicauth");
+    const messages = await lint(fixture.content, { ext: fixture.ext });
+    expect(messages.some((message) => message.messageId === fixture.messageId)).toBe(true);
+  });
+});
 
 describe("shannonEntropy", () => {
   it("is 0 for an empty string", () => {
@@ -148,6 +212,31 @@ describe("isAllowlistedRun", () => {
 
   it("does not exempt a run merely containing a UUID shape with extra trailing content", () => {
     expect(isAllowlistedRun("550e8400-e29b-41d4-a716-446655440000-REALSECRET")).toBe(false);
+  });
+
+  it("exempts an opencode session identifier", () => {
+    expect(isAllowlistedRun("ses_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0J")).toBe(true); // pragma: allowlist secret
+  });
+
+  it.each(["ses", "msg", "prt", "per", "psv", "frm", "wrk", "evt", "sh", "cred", "pty", "con"])(
+    "exempts an opencode identifier with the %s_ prefix",
+    (prefix) => {
+      expect(isAllowlistedRun(`${prefix}_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0J`)).toBe(true);
+    },
+  );
+
+  it("does not exempt an opencode identifier with a secret glued to it", () => {
+    expect(isAllowlistedRun("ses_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0J-REALSECRET")).toBe(false); // pragma: allowlist secret
+    expect(isAllowlistedRun("REALSECRET-ses_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0J")).toBe(false); // pragma: allowlist secret
+  });
+
+  it("does not exempt an opencode-prefixed run with a suffix of the wrong length", () => {
+    expect(isAllowlistedRun("ses_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0")).toBe(false); // pragma: allowlist secret
+    expect(isAllowlistedRun("ses_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0Jx")).toBe(false); // pragma: allowlist secret
+  });
+
+  it("does not exempt an unknown prefix with a 26-character base-62 suffix", () => {
+    expect(isAllowlistedRun("foo_4Qe7Lk2Vb9Xr1Tn8Hc3Mz6Wd0J")).toBe(false); // pragma: allowlist secret
   });
 
   it("exempts a Subresource Integrity hash", () => {
@@ -471,14 +560,7 @@ describe("SHORT_PASSWORD_FIXTURES (design.md verified fixtures)", () => {
   });
 });
 
-// spec: openspec/changes/fix-url-entropy-false-positive/specs/high-entropy-secret-detection/spec.md
-//
-// The '/' character is a legitimate standard-base64 alphabet character AND
-// the URL path separator. Without URL-span awareness, an ordinary
-// multi-segment URL path gets glued into one candidate run by
-// findCandidateRuns and trivially exceeds the base64 threshold. These
-// tests cover the fix: a URL span's '/' is treated as a hard run boundary,
-// while a '/'-containing run outside any URL span is unaffected.
+// spec: openspec/specs/high-entropy-secret-detection/spec.md
 
 describe("findUrlSpans", () => {
   it("finds an http(s) URL span up to the next whitespace", () => {
@@ -522,17 +604,23 @@ describe("findHighEntropyFindings — URL path false-positive fix", () => {
     expect(findHighEntropyFindings(url)).toEqual([]);
   });
 
-  it("still flags a genuinely high-entropy segment within a URL path", () => {
+  it("Preserves complete URLs regardless of segment entropy", () => {
     // 36 distinct base64-alphabet characters (0-9, a-z once each):
     // H = log2(36) ≈ 5.17, comfortably above the 4.5 base64 threshold.
     const secret = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const url = `https://example.com/download/${secret}/file`;
-    const findings = findHighEntropyFindings(url);
-    expect(findings).toHaveLength(1);
-    expect(url.slice(findings[0].start, findings[0].end)).toBe(secret);
+    const short = SHORT_PASSWORD_FIXTURES.find((fixture) => fixture.expectFinding).content;
+    for (const token of [secret, short]) {
+      for (const url of [
+        `https://${token}.invalid/download/${token}/file`,
+        `custom://${token}:${token}@example.invalid/?key=${token}#${token}`,
+        `https://example.invalid/${token},${token};${token}`,
+      ]) {
+        expect(findHighEntropyFindings(url), url).toEqual([]);
+      }
+    }
   });
 
-  it("does not affect a base64/hex run outside any URL span", () => {
+  it("Leaves unanchored slash-containing credentials detectable", () => {
     // a base64-shaped run containing '/', with no scheme:// prefix, so no
     // URL span is detected and the run is scored exactly as before this
     // change (unsplit).
@@ -544,17 +632,7 @@ describe("findHighEntropyFindings — URL path false-positive fix", () => {
     expect(text.slice(findings[0].start, findings[0].end)).toBe(`value=${withSlash}`);
   });
 
-  it("does not split a run that only straddles into a URL span from outside it (accepted limitation)", () => {
-    // isWithinAnySpan requires full containment, so a run beginning
-    // before a URL span -- containing its own unrelated '/' -- and
-    // merging into the span (e.g. glued directly onto a scheme with no
-    // whitespace/quote break) is left entirely unsplit. Narrow and
-    // practically unreachable in the chat/tool-output text this scanner
-    // targets (a URL is virtually always preceded by whitespace or a
-    // quote there, which already ends the run before the scheme begins).
-    // Documented here as an accepted, intentional limitation rather than
-    // a silently unhandled case: the composite run is scored exactly as
-    // findCandidateRuns did before this change.
+  it("keeps a crossing candidate intact for exemption subtraction", () => {
     const secret = Array.from({ length: 20 }, (_, i) => i.toString(36)).join("");
     const text = `${secret}/rest=https://example.com/a/b end`;
     const runs = findCandidateRuns(text);
@@ -562,17 +640,7 @@ describe("findHighEntropyFindings — URL path false-positive fix", () => {
   });
 });
 
-// spec: openspec/changes/fix-filesystem-path-entropy-false-positive/specs/high-entropy-secret-detection/spec.md
-//
-// A filesystem path has no `scheme://` prefix, so `findUrlSpans` never
-// covers it: an ordinary `/`-glued path (e.g. a branch/worktree directory
-// name) is otherwise tokenized as one candidate run and can trivially
-// exceed the base64 threshold on character diversity alone, with no
-// secret present. These tests cover the fix: an anchored filesystem path
-// span's `/` is treated as a hard run boundary (same as inside a URL
-// span), while an unanchored `/`-containing run is unaffected, and a
-// span containing a `+`/`=` or fewer than 2 `/` is discarded rather than
-// gating a real base64 blob's split.
+// spec: openspec/specs/high-entropy-secret-detection/spec.md
 
 describe("findPathSpans", () => {
   it("finds one span covering a whole POSIX absolute path (T1)", () => {
@@ -626,30 +694,29 @@ describe("findPathSpans", () => {
     expect(findPathSpans("x=./a/b")).toEqual([]);
     expect(findPathSpans("...../a/b")).toEqual([]);
     expect(findPathSpans("no-anchor-here/foo/bar")).toEqual([]);
-    expect(findPathSpans("C:\\Users\\x")).toEqual([]);
+    expect(findPathSpans("x=C:\\Users\\x")).toEqual([]);
   });
 
   it("finds no path span for a bare scheme:// URL (already governed by findUrlSpans) (T7)", () => {
     expect(findPathSpans("https://example.com/a/b")).toEqual([]);
   });
 
-  it("discards a span whose text contains a '+' (T8)", () => {
+  it("recognizes a path containing '+'", () => {
     const secret36 = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
     const text = `"${"/" + secret36.slice(0, 17) + "+" + secret36.slice(17, 18) + "/" + secret36.slice(18)}"`;
-    expect(findPathSpans(text)).toEqual([]);
+    expect(findPathSpans(text)).toEqual([{ start: 1, end: text.length - 1 }]);
   });
 
-  it("discards a span whose text contains an '=' (T9)", () => {
+  it("recognizes a path containing '='", () => {
     const secret36 = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
     const text = `"${"/" + secret36.slice(0, 17) + "/" + secret36.slice(17) + "="}"`;
-    expect(findPathSpans(text)).toEqual([]);
+    expect(findPathSpans(text)).toEqual([{ start: 1, end: text.length - 1 }]);
   });
 
-  it("discards a span containing fewer than 2 total '/' characters (T10)", () => {
+  it("recognizes a single-component absolute path", () => {
     const secret36 = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
     const text = `"${"/" + secret36}"`;
-    expect(findPathSpans(text)).toEqual([]);
-    expect(findPathSpans("a / b")).toEqual([]);
+    expect(findPathSpans(text)).toEqual([{ start: 1, end: text.length - 1 }]);
   });
 });
 
@@ -683,59 +750,22 @@ describe("findHighEntropyFindings — filesystem path false-positive fix", () =>
     }
   });
 
-  it("still flags a genuine secret inside a filesystem path (T14)", () => {
+  it("Preserves complete Linux and Windows filesystem paths", () => {
     const secret = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const text = `/home/user/tokens/${secret}/file.txt`;
-    const findings = findHighEntropyFindings(text);
-    expect(findings).toHaveLength(1);
-    expect(text.slice(findings[0].start, findings[0].end)).toBe(secret);
+    const short = SHORT_PASSWORD_FIXTURES.find((fixture) => fixture.expectFinding).content;
+    for (const token of [secret, short]) {
+      for (const path of [
+        `/${token}`, `/home/user/${token}/file.txt`, `./${token}`, `../${token}`,
+        `~/${token}`, `C:/${token}/file`, `C:\\${token}\\file`,
+        `\\\\server\\share\\${token}`, `.\\${token}`, `..\\${token}`, `~\\${token}`,
+        `/${token}+suffix=`,
+      ]) {
+        expect(findHighEntropyFindings(`see \`${path}\` here`), path).toEqual([]);
+      }
+    }
   });
 
-  it("still flags a genuine secret inside a backtick-wrapped filesystem path embedded in a sentence (T15)", () => {
-    const secret = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const text = `token found at \`/home/user/tokens/${secret}/file.txt\` in the log`;
-    const findings = findHighEntropyFindings(text);
-    expect(findings).toHaveLength(1);
-    expect(text.slice(findings[0].start, findings[0].end)).toBe(secret);
-  });
-
-  it("false-negative guard: a quoted standard-base64 secret beginning with '/' and containing '+' is still reported whole (T16)", () => {
-    const secret36 = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const blob = "/" + secret36.slice(0, 17) + "+" + secret36.slice(17, 18) + "/" + secret36.slice(18);
-    const text = `secret="${blob}" end`;
-    const findings = findHighEntropyFindings(text);
-    expect(findings).toHaveLength(1);
-    expect(text.slice(findings[0].start, findings[0].end)).toBe(blob);
-  });
-
-  it("false-negative guard: a quoted standard-base64 secret with an internal '/' and a trailing '=' is still reported whole (T17)", () => {
-    const secret36 = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const blob = "/" + secret36.slice(0, 17) + "/" + secret36.slice(17) + "=";
-    const text = `secret="${blob}" end`;
-    const findings = findHighEntropyFindings(text);
-    expect(findings).toHaveLength(1);
-    expect(text.slice(findings[0].start, findings[0].end)).toBe(blob);
-  });
-
-  it("false-negative guard: a quoted base64 secret beginning with '/' and no other '/' is still reported whole (T18)", () => {
-    const secret36 = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const blob = "/" + secret36;
-    const text = `secret="${blob}" end`;
-    const findings = findHighEntropyFindings(text);
-    expect(findings).toHaveLength(1);
-    expect(text.slice(findings[0].start, findings[0].end)).toBe(blob);
-  });
-
-  it("documents the accepted residual false-negative: a genuine secret split by an anchored path span into sub-floor segments is no longer reported (T19)", () => {
-    // A combined run whose full diversity spans multiple short path
-    // segments clears both the 23-char floor and the 4.5 threshold as a
-    // whole, but once its anchored path span causes it to be split on
-    // '/' into segments of 7 characters each, every segment
-    // individually falls below every detection path's floor (base64 23,
-    // hex 9, short-password 14) and none is reported. This is the
-    // deliberate, documented price of an anchor much weaker than
-    // `scheme://` (see design.md Risks / Trade-offs) -- accepted and not
-    // further mitigated.
+  it("preserves an anchored path made of diverse short components", () => {
     const blob = "/home/user/xK7bQ2z/mR9wQ3f/vN6sL1y/output";  // pragma: allowlist secret
     expect(shannonEntropy(blob)).toBeGreaterThan(4.5);
     const text = `secret: ${blob} end`;

@@ -1,4 +1,4 @@
-// spec: openspec/changes/add-user-message-redaction/specs/user-message-redaction/spec.md
+// spec: openspec/specs/user-message-redaction/spec.md
 //
 // Tests for splitNoRedactSegments against the fence grammar table in
 // design.md D4, plus the two D5 invariants (round-trip, no empty segments)

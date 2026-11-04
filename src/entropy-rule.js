@@ -11,50 +11,14 @@
 // disjoint by construction.
 const CANDIDATE_RUN_PATTERN = /[A-Za-z0-9+/=_-]+/g;
 
-// See openspec/changes/fix-url-entropy-false-positive and
-// fix-filesystem-path-entropy-false-positive: `/` is a legitimate
-// standard-base64 alphabet character AND both the URL path separator and
-// the filesystem path separator, so a multi-segment URL or filesystem
-// path is otherwise glued into one candidate run and trivially exceeds
-// the base64 threshold on diversity alone, with no secret present.
-// `findUrlSpans` detects `scheme://…` spans (any RFC 3986-shaped scheme,
-// not just http/https) and `findPathSpans` detects anchored filesystem
-// path spans, so `findCandidateRuns` can treat a run's `/` as a hard
-// boundary when — and only when — that run falls within a detected URL
-// span or path span.
-const URL_SPAN_PATTERN = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'<>()]+/g;
-
-// See openspec/changes/fix-filesystem-path-entropy-false-positive
-// design.md D1/D2: the boundary/terminator set is `findUrlSpans`'s set
-// plus backtick and square/curly brackets (backtick is mandatory — the
-// motivating output is Markdown-quoted). A path span runs from a boundary
-// to the next boundary; the fixed-width negative lookbehind checks "the
-// preceding character is not itself a non-boundary character" (true at
-// start-of-string for free), and the greedy body is over every
-// non-boundary character — including `.` — so one span covers a whole
-// dot-broken path rather than only its base64/hex-charset fragments.
+// spec: openspec/specs/high-entropy-secret-detection/spec.md
+// Quotes and brackets terminate spans, including Markdown backticks.
+// Commas and semicolons remain valid URL/path content.
+const URL_SPAN_PATTERN = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'`()[\]{}<>]+/g;
 const PATH_SPAN_PATTERN =
-  /(?<![^\s"'`()[\]{}<>])(?:[A-Za-z]:\/|(?:\.\.?|~)\/|\/)[^\s"'`()[\]{}<>]*/g;
-
-/**
- * See design.md D3: an anchor much weaker than `scheme://` bounds a wider
- * false-negative surface, so a detected path span is discarded — treated
- * as an ordinary run, not path-split — when its text contains `+` or `=`
- * (essentially never present in a real path, common in standard base64)
- * or when it contains fewer than 2 `/` characters in total (a single
- * slash is as likely a base64 fragment as a path). This is a post-match
- * filter, never a pattern-internal lookahead: a lookahead would not
- * discard the match, it would make the greedy body backtrack to a
- * shorter span ending just before the disqualifying character, which
- * would still gate a partial (and wrong) `/`-split of a real base64 blob.
- */
-function isDiscardedPathSpan(spanText) {
-  if (spanText.includes("+") || spanText.includes("=")) {
-    return true;
-  }
-  const slashCount = (spanText.match(/\//g) ?? []).length;
-  return slashCount < 2;
-}
+  /(?<![^\s"'`()[\]{}<>])(?:[A-Za-z]:[\\/]|(?:\.\.?|~)[\\/]|\\\\|\/)[^\s"'`()[\]{}<>]*/g;
+const VALUE_TOKEN_PATTERN = /[^\s"'`()[\]{}<>,;]+/g;
+const NUMERIC_VALUE_PATTERN = /^(?:[A-Za-z_$][\w$]*[=:])?([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$/;
 
 const HEX_CLASS_PATTERN = /^[0-9a-fA-F]+$/;
 const BASE64_CLASS_PATTERN = /^[A-Za-z0-9+/=_-]+$/;
@@ -103,9 +67,7 @@ function isWithinAnySpan(run, spans) {
 /**
  * Finds every URL-shaped span in `text`: an RFC 3986-shaped scheme
  * (letter, then letters/digits/`+`/`.`/`-`) followed by `://` and every
- * non-whitespace, non-quote, non-bracket character after it. Used only to
- * decide where a candidate run's `/` is a path separator rather than a
- * base64 continuation character — see `findCandidateRuns`.
+ * non-whitespace, non-quote, non-bracket character after it.
  */
 export function findUrlSpans(text) {
   const spans = [];
@@ -117,39 +79,67 @@ export function findUrlSpans(text) {
 
 /**
  * Finds every anchored filesystem-path-shaped span in `text`: a POSIX
- * absolute path (`/…`), a Windows drive-letter forward-slash absolute
- * path (`C:/…`), or a relative path (`./…`, `../…`, `~/…`), each anchor
- * itself sitting at a boundary character or the start of the text. See
- * design.md D1-D3 for the full derivation. A matched span is discarded
- * (and excluded from the returned array) when it contains `+` or `=`, or
- * fewer than 2 `/` characters in total — see `isDiscardedPathSpan`. Used
- * only to decide where a candidate run's `/` is a path separator rather
- * than a base64 continuation character — see `findCandidateRuns`.
+ * absolute path, Windows drive or UNC path, or dot/home-relative path
+ * using either separator, anchored at a boundary or the start of text.
  */
 export function findPathSpans(text) {
   const spans = [];
   for (const match of text.matchAll(PATH_SPAN_PATTERN)) {
-    if (isDiscardedPathSpan(match[0])) {
-      continue;
-    }
     spans.push({ start: match.index, end: match.index + match[0].length });
   }
   return spans;
+}
+
+function findNumericSpans(text) {
+  const spans = [];
+  for (const token of text.matchAll(VALUE_TOKEN_PATTERN)) {
+    const number = NUMERIC_VALUE_PATTERN.exec(token[0])?.[1];
+    if (number === undefined) {
+      continue;
+    }
+    const end = token.index + token[0].length;
+    spans.push({ start: end - number.length, end });
+  }
+  return spans;
+}
+
+// Subtract, rather than discard overlapping runs: a token can begin
+// outside an exemption and continue into a URL scheme without a break.
+// Spans must be sorted by start; overlapping spans are supported.
+function subtractSpans(runs, spans) {
+  const fragments = [];
+  for (const run of runs) {
+    let start = run.start;
+    for (const span of spans) {
+      if (span.end <= start || span.start >= run.end) {
+        continue;
+      }
+      if (span.start > start) {
+        fragments.push({ start, end: span.start, text: run.text.slice(start - run.start, span.start - run.start) });
+      }
+      start = Math.max(start, span.end);
+      if (start >= run.end) {
+        break;
+      }
+    }
+    if (start < run.end) {
+      fragments.push({ start, end: run.end, text: run.text.slice(start - run.start) });
+    }
+  }
+  return fragments;
 }
 
 /**
  * Returns every maximal run of the candidate charset in `text`, in source
  * order, as `{ start, end, text }`. Disjoint by construction.
  *
- * A run that overlaps a detected URL span (`findUrlSpans`) or a detected
- * filesystem path span (`findPathSpans`) and contains `/` is split back
- * into its `/`-delimited segments here, each reported as its own run — a
- * URL or filesystem path's `/` is a structural separator, not part of a
- * base64 blob, even though `/` is itself a valid base64 character. A run
- * outside any such span, or one inside a span with no `/`, is unaffected.
+ * Slash splitting is retained for this exported helper's default behavior:
+ * runs contained within URL/path spans are split into slash-delimited segments.
+ * The scoring caller subsequently subtracts those spans entirely.
+ * `separatorSpans` supplies containment regions for splitting, not exclusions;
+ * callers may reuse broader precomputed spans (numeric spans contain no `/`).
  */
-export function findCandidateRuns(text) {
-  const separatorSpans = [...findUrlSpans(text), ...findPathSpans(text)];
+export function findCandidateRuns(text, separatorSpans = [...findUrlSpans(text), ...findPathSpans(text)]) {
   const runs = [];
   for (const match of text.matchAll(CANDIDATE_RUN_PATTERN)) {
     const start = match.index;
@@ -207,6 +197,11 @@ const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 // base64 digest is indistinguishable from a base64-encoded API secret and
 // is deliberately NOT exempted.
 const SRI_PATTERN = /^sha(?:1|256|384|512)-[A-Za-z0-9+/_-]+={0,2}$/;
+// Shape #4: opencode-generated identifier (`ses_`, `msg_`, ...): a known
+// prefix, an underscore, then exactly 26 base-62 characters. Anchored to the
+// whole run so a secret glued onto an identifier is still reported.
+const OPENCODE_ID_PATTERN =
+  /^(?:ses|msg|prt|per|psv|frm|wrk|evt|sh|cred|pty|con)_[0-9A-Za-z]{26}$/;
 
 /**
  * Returns true when `run` matches one of the anchored allowlist shapes
@@ -214,7 +209,12 @@ const SRI_PATTERN = /^sha(?:1|256|384|512)-[A-Za-z0-9+/_-]+={0,2}$/;
  * should never be reported, regardless of its measured entropy.
  */
 export function isAllowlistedRun(run) {
-  return GIT_OR_DIGEST_HEX_PATTERN.test(run) || UUID_PATTERN.test(run) || SRI_PATTERN.test(run);
+  return (
+    GIT_OR_DIGEST_HEX_PATTERN.test(run) ||
+    UUID_PATTERN.test(run) ||
+    SRI_PATTERN.test(run) ||
+    OPENCODE_ID_PATTERN.test(run)
+  );
 }
 
 // D5 #4: a JWT cannot be matched as a single candidate run (`.` is not in
@@ -329,6 +329,8 @@ export function hasLongClassRun(run) {
  */
 export function findHighEntropyFindings(text) {
   const jwtSpans = findJwtSpans(text);
+  const scoringExemptions = [...findUrlSpans(text), ...findPathSpans(text), ...findNumericSpans(text)]
+    .sort((a, b) => a.start - b.start);
   const findings = [];
 
   for (const span of jwtSpans) {
@@ -337,7 +339,7 @@ export function findHighEntropyFindings(text) {
     }
   }
 
-  const existingRuns = findCandidateRuns(text);
+  const existingRuns = subtractSpans(findCandidateRuns(text, scoringExemptions), scoringExemptions);
   const allowlistedSpans = [];
 
   for (const run of existingRuns) {
@@ -364,7 +366,7 @@ export function findHighEntropyFindings(text) {
   // rules out, nor double-report a JWT's header/payload.
   const exemptSpans = [...jwtSpans, ...allowlistedSpans];
 
-  for (const run of findPasswordCandidateRuns(text)) {
+  for (const run of subtractSpans(findPasswordCandidateRuns(text), scoringExemptions)) {
     if (run.text.length < SHORT_MIN_LENGTH || run.text.length > SHORT_MAX_LENGTH) {
       continue;
     }

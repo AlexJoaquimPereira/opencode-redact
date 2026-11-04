@@ -1,0 +1,6 @@
+- [x] Encode and pass “Preserves complete URLs regardless of segment entropy” and “Preserves complete Linux and Windows filesystem paths” using shared intervals from design.md.
+- [x] Encode and pass “Preserves integers decimals and scientific notation” and “Does not exempt numeric fragments inside credentials” using complete numeric context from design.md.
+- [x] Encode and pass “Detects secrets adjacent to exempt spans”, “Detects outside fragments of candidates crossing exemption boundaries”, and “Leaves unanchored slash-containing credentials detectable”.
+- [x] Verify “Keeps explicit credential detection active inside exempt spans” and “Keeps JWT signature detection active inside exempt spans”.
+- [x] Update README.md with exemptions and limitations and verify against the delta spec.
+- [x] Run npm test, available coverage, pre-commit hooks, and OpenSpec validation; resolve review findings.

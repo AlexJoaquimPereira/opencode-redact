@@ -201,122 +201,79 @@ handling already governs.
   password path's length, case-mix, run-cap, and entropy conditions
 - **THEN** that substring is not reported by the short password path
 
-### Requirement: Treat URL Path Separators As Candidate-Run Boundaries
-The system SHALL treat the `/` character as a boundary that ends a
-base64/hex candidate run — never as a charset-continuation character —
-whenever that `/` falls within a detected URL span (a `scheme://` span
-beginning with a recognized URL scheme) or within a detected filesystem
-path span, and SHALL continue to evaluate each `/`-delimited segment of
-such a span independently against the existing base64/hex detection
-rules. A filesystem path span is a maximal run of non-boundary characters
-(boundary characters being whitespace, `"`, `'`, `` ` ``, and the bracket
-characters `(`, `)`, `[`, `]`, `{`, `}`, `<`, `>`) beginning at one of
-three anchors, each of which must itself begin at a boundary character or
-at the start of the scanned text: a `/` (POSIX absolute), a single letter
-followed by `:` and `/` (Windows forward-slash absolute), or a `.`, `..`,
-or `~` followed by `/` (relative). A path span's body includes every
-non-boundary character, `.` among them, so a single span covers a whole
-path rather than only its base64/hex-charset fragments. A detected path
-span SHALL be discarded — leaving the runs it covers tokenized exactly as
-they were before this requirement — when its text contains a `+` or an
-`=`, or when it contains fewer than two `/` characters in total. Outside
-every detected URL span and every retained path span, or for a candidate
-run inside such a span that contains no `/`, tokenization is unaffected
-by this requirement.
+### Requirement: Exempt URL And Filesystem Path Spans From Entropy Scoring
+The system SHALL exclude complete URL and anchored filesystem-path spans from generic and short-password entropy scoring, without disabling explicit secret-pattern rules or unconditional JWT-signature detection.
 
-#### Scenario: Does not flag an ordinary multi-segment URL path as one high-entropy blob
-- **WHEN** a message contains a URL whose path consists of multiple
-  `/`-separated segments (for example an organization, repository, and
-  commit id) whose concatenation would exceed the base64 threshold if
-  scored as a single run, but no individual `/`-delimited segment
-  exceeds its charset's threshold on its own
-- **THEN** no finding is reported for that URL's path
+#### Scenario: Preserves complete URLs regardless of segment entropy
+- **WHEN** a scheme-shaped `scheme://` URL contains high-entropy host, userinfo, path, query, or fragment text
+- **THEN** neither entropy-scoring pass reports that URL content
+- **AND** spans terminate at whitespace, quotes, backticks, or round/square/curly/angle brackets; commas and semicolons remain URL content
 
-#### Scenario: Still flags a genuinely high-entropy segment within a URL path
-- **WHEN** a message contains a URL whose path includes a single
-  `/`-delimited segment that, evaluated on its own, is drawn from the
-  base64 or hex alphabet, meets the minimum length floor for its
-  charset, and exceeds that charset's entropy threshold
-- **THEN** that segment is still reported as a candidate high-entropy
-  secret
+#### Scenario: Preserves complete Linux and Windows filesystem paths
+- **WHEN** a boundary-anchored path begins with `/`, `./`, `../`, `~/`, a Windows drive plus either separator, a UNC prefix, or a backslash relative anchor
+- **THEN** neither entropy-scoring pass reports any path segment, including single-segment paths and paths containing `+` or `=`
+- **AND** path spans use the same terminators as URL spans
 
-#### Scenario: Does not affect a base64/hex run outside any URL span
-- **WHEN** a message contains a base64- or hex-shaped substring
-  containing `/` that is not within any detected URL span and not within
-  any retained filesystem path span
-- **THEN** that substring is tokenized and evaluated exactly as it was
-  before this requirement — as a single run, per the existing
-  candidate-run detection rules
+#### Scenario: Keeps explicit credential detection active inside exempt spans
+- **WHEN** an exempt URL or filesystem path contains a credential recognized by an explicit secret-pattern rule
+- **THEN** that rule still reports the credential
 
-#### Scenario: Does not flag an ordinary POSIX absolute path as one high-entropy blob
-- **WHEN** a message contains a POSIX absolute path (beginning with `/`
-  at a boundary or the start of the text) whose `/`-delimited segments
-  would exceed the base64 threshold if scored as a single run, but no
-  individual segment exceeds its charset's threshold on its own
-- **THEN** no finding is reported for that path
+#### Scenario: Keeps JWT signature detection active inside exempt spans
+- **WHEN** a URL or filesystem path contains a JWT-shaped token with a nonempty signature
+- **THEN** the signature is still reported by the JWT detector
 
-#### Scenario: Does not flag an ordinary Windows drive-letter forward-slash path as one high-entropy blob
-- **WHEN** a message contains a Windows-style absolute path using
-  forward slashes (for example `C:/Users/name/project`) whose
-  `/`-delimited segments would exceed the base64 threshold if scored as
-  a single run, but no individual segment exceeds its charset's
-  threshold on its own
-- **THEN** no finding is reported for that path
+### Requirement: Exempt Complete Numeric Values From Entropy Scoring
+The system SHALL exclude complete signed or unsigned decimal numeric values from entropy scoring, including integer and decimal mantissas and optional signed scientific exponents, when standalone, delimited, or assigned after an identifier and `=` or `:`.
 
-#### Scenario: Does not flag an ordinary relative path as one high-entropy blob
-- **WHEN** a message contains a relative path beginning with `./`, `../`,
-  or `~/` (itself at a boundary or the start of the text) whose
-  `/`-delimited segments would exceed the base64 threshold if scored as
-  a single run, but no individual segment exceeds its charset's
-  threshold on its own
-- **THEN** no finding is reported for that path
+#### Scenario: Preserves integers decimals and scientific notation
+- **WHEN** a message contains complete numeric values, including long digit sequences, leading/trailing decimal points, signs, or scientific exponents
+- **THEN** no entropy finding covers those values
+- **AND** assignment labels remain outside the numeric exemption
 
-#### Scenario: A path span covers dot-prefixed segments as part of the same span
-- **WHEN** a message contains an absolute or relative path in which one
-  or more `/`-delimited segments themselves begin with a `.` (for
-  example a hidden directory such as `.worktrees` or `.venv`), such that
-  the base64/hex candidate-run tokenizer would otherwise split the path
-  into multiple disconnected runs at each `.`
-- **THEN** the whole path — including its dot-prefixed segments — is
-  treated as a single filesystem path span, so every one of its
-  `/`-delimited candidate runs is eligible for the `/`-boundary
-  treatment this requirement defines
+#### Scenario: Does not exempt numeric fragments inside credentials
+- **WHEN** a detectable nonnumeric credential contains numeric-looking prefixes, suffixes, or decimal/scientific fragments
+- **THEN** numeric recognition does not suppress its entropy findings
 
-#### Scenario: Still flags a genuinely high-entropy segment within a filesystem path
-- **WHEN** a message contains a filesystem path whose path span includes
-  a single `/`-delimited segment that, evaluated on its own, is drawn
-  from the base64 or hex alphabet, meets the minimum length floor for
-  its charset, and exceeds that charset's entropy threshold
-- **THEN** that segment is still reported as a candidate high-entropy
-  secret
+### Requirement: Bound Entropy Exemptions To Recognized Spans
+The system SHALL retain entropy detection outside recognized exemption intervals, including outside portions of candidates crossing an exemption boundary, without interpreting unanchored slash-containing credentials as filesystem paths.
 
-#### Scenario: Does not split a slash-containing run whose path span contains a plus or equals character
-- **WHEN** a candidate run containing `/` falls within a span that would
-  otherwise be recognized as a filesystem path span, but that span's
-  text contains a `+` or an `=` character
-- **THEN** the span is discarded and that run is tokenized and evaluated
-  exactly as it was before this requirement — as a single run
+#### Scenario: Detects secrets adjacent to exempt spans
+- **WHEN** generic or short-password secrets occur outside exempt spans separated by the defined terminators
+- **THEN** their original source ranges are reported while exempt content remains unreported
 
-#### Scenario: Does not split a slash-containing run whose path span contains fewer than two slashes
-- **WHEN** a candidate run containing `/` falls within a span that would
-  otherwise be recognized as a filesystem path span, but that span
-  contains fewer than two `/` characters in total
-- **THEN** the span is discarded and that run is tokenized and evaluated
-  exactly as it was before this requirement — as a single run
+#### Scenario: Detects outside fragments of candidates crossing exemption boundaries
+- **WHEN** an entropy candidate crosses into a recognized URL or filesystem-path span
+- **THEN** its outside fragment is independently scored at its original source offsets
 
-#### Scenario: Does not detect a path span whose anchor is not at a boundary character
-- **WHEN** a message contains a `/`, a drive-letter-and-colon-and-`/`, or
-  a `.`/`..`/`~`-and-`/` sequence that is itself immediately preceded by
-  a non-boundary character (for example the `/` following `=` in
-  `PATH=/usr/bin`, or the `/` inside a `scheme://` URL span)
-- **THEN** no filesystem path span is detected at that position, and
-  tokenization of any run containing it is unaffected by this
-  requirement
+#### Scenario: Leaves unanchored slash-containing credentials detectable
+- **WHEN** a detectable slash-containing credential has no boundary-anchored path or scheme-shaped URL
+- **THEN** it remains scored normally
 
-#### Scenario: Does not affect a native Windows backslash path
-- **WHEN** a message contains a native Windows path using backslash
-  separators (for example `C:\Users\name\project`)
-- **THEN** tokenization is unaffected by this requirement, because `\`
-  is not part of the base64/hex candidate-run charset and the path
-  segments are already separated by the tokenizer independently of any
-  span detection
+### Requirement: Exempt Opencode Identifiers From Detection
+
+The system SHALL NOT report as a high-entropy secret a candidate run that consists entirely of an opencode identifier: one of the known opencode ID prefixes (`ses`, `msg`, `prt`, `per`, `psv`, `frm`, `wrk`, `evt`, `sh`, `cred`, `pty`, `con`), an underscore, then exactly 26 base-62 characters (`0-9`, `A-Z`, `a-z`). The exemption applies to the whole run only.
+
+#### Scenario: Exempts a session identifier
+
+- **WHEN** tool output contains a standalone `ses_` followed by 26 mixed-case alphanumeric characters
+- **THEN** the system does not report that identifier as a high-entropy finding
+
+#### Scenario: Exempts other opencode identifier prefixes
+
+- **WHEN** tool output contains a standalone `msg_`, `prt_`, or `per_` identifier with 26 base-62 characters
+- **THEN** the system does not report that identifier as a high-entropy finding
+
+#### Scenario: Still reports a secret glued to an identifier
+
+- **WHEN** a candidate run is an opencode identifier with additional text appended or prepended
+- **THEN** the system reports the run as a high-entropy finding
+
+#### Scenario: Still reports an identifier with the wrong suffix length
+
+- **WHEN** a candidate run has a known opencode prefix and a suffix of 25 or 27 base-62 characters
+- **THEN** the system reports the run as a high-entropy finding
+
+#### Scenario: Still reports an unknown prefix
+
+- **WHEN** a candidate run has an unrecognised `<word>_` prefix followed by 26 base-62 characters and the entropy exceeds the threshold
+- **THEN** the system reports the run as a high-entropy finding

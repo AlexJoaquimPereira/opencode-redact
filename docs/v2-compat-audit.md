@@ -232,40 +232,34 @@ archived) for the full design record and delta specs.
   re-exports `opencode-redact/v2` (or a local `src/plugin.v2.js`); see the
   README "Install" section.
 
-## Update — 2026-10-14 (content-part tightening, signed-reasoning exemption, and request-history ownership)
+## V2 content-part and ownership contracts
 
-A maintainer review of the `fix/tool-error-and-contentpart-redaction` PR
-raised two questions: whether redacting a `reasoning` part is protocol-safe,
-and whether the session-hook handler's array-slot mutation (`blocks[i] =
-redacted.part`) can rewrite the session's persisted message history. Both
-are answered here against opencode v2.0.26 source (`sst/opencode` tag
-`v2.0.26`, release commit `9b4ec57`; `packages/core/...`).
+The ownership and serialization traces below apply to inspected OpenCode
+2.0.26 source. The published `@opencode/plugin@2.0.4` definitions also expose
+`SessionHooks.title` and include `title` in `SessionRequestKind`, so title
+registration needs neither a peer-floor increase nor a compatibility shim.
 
 ### Signed reasoning is exempt — provider SDKs reject modified thinking
 
 A `reasoning` part carries `providerMetadata` proof-of-generation scoped to
 the model that produced it (Anthropic message/thinking signature, Gemini
-thought signatures, OpenAI encrypted reasoning). The tightened handler no
-longer scans `reasoning` parts at all: Anthropic and AWS Bedrock reject a
-request whose thinking blocks were modified after generation, so an edited
-text with an unchanged signature is invalid state — and passing the secret
-through (or dropping the protocol metadata) is not a substitute. Redacting
+thought signatures, OpenAI encrypted reasoning). The handler leaves
+`reasoning` parts unmodified: Anthropic and AWS Bedrock reject a request
+whose thinking blocks were modified after generation, so editing signed
+reasoning is not a compatible redaction policy. Secrets in these parts
+remain unredacted. Redacting
 signed reasoning is deferred until a provider-compatible confidentiality
 policy exists, with a tool-use/replay regression test; see the README's
 "Known limitations" entry.
 
 ### Hook-bound history is a per-request derivation, not the persisted record
 
-Trace of what the host actually hands the session hooks (`context`,
-`generate`, `compaction`) and what it keeps:
+Trace of what the host hands the session hooks (`context`, `generate`,
+`compaction`, `title`) and what it keeps:
 
 - **Per-request assembly.** `packages/core/src/session/model-request.ts`
-  `baseTranscript` (:100-120) builds the transcript **fresh on every
-  provider call**: `system` is a new array of `SystemPart.make(...)`;
-  `messages` comes from `toLLMMessages(...)` (`.runner/llm.ts` re-derives
-  after each `context.load` — "retries refresh context", `llm.ts:215`,
-  called per step at `llm.ts:224-230`). History entries are pulled from
-  session storage each load (`context.ts:176` maps DB-queried entries).
+  `baseTranscript` (:100-120) builds fresh `system` and `messages` arrays
+  for each request through `SystemPart.make(...)` and `toLLMMessages(...)`.
 - **Fresh objects per message.** `to-llm-message.ts` `toLLMMessage`
   (:253-334) constructs entirely new `Message` objects from projected
   `SessionMessage.Info` fields; the assistant branch (:153-233) builds new
@@ -280,7 +274,7 @@ Trace of what the host actually hands the session hooks (`context`,
   `system: shaped.system`,
   `messages: boundImages(unsupportedParts(shaped.messages, ...))`).
 - **Why the plugin still copies.** Inner objects are not always fresh:
-  `toolInput()` (`to-llm-message.ts:86-88`) hands the stored
+  `toolInput()` (`to-llm-message.ts:111-115`) hands the stored
   `tool.state.input` object through by reference, and metadata objects may
   be shared. The plugin's deep walk is strictly copy-on-write —
   `redactObjectStrings` rebuilds only containers whose strings changed and
@@ -301,6 +295,45 @@ original part objects untouched. The conformance tests cover all three
 invariants (payload redacted vs. snapshot preserved, frozen parts never
 written, replaced slots leaving originals' raw values intact).
 
+### Tool-call signature metadata and ordering
+
+In `packages/ai/src/protocols/gemini.ts:728-769`, the decoder maps
+`functionCall.args` to `input` and the same part's `thoughtSignature` to
+`providerMetadata[providerMetadataKey].thoughtSignature`. Outbound
+serialization (:293-303) maps these independently; :341-386 retains part
+order and permits unsigned parallel siblings after a signed first call.
+
+Google's GenerateContent thought-signature contract requires retaining each
+signature on its original part and maintaining call ordering, including
+parallel siblings. The inspected contract does not establish whether the
+signature cryptographically binds argument bytes. The plugin redacts inputs
+while preserving metadata, identifiers, names, ordering, and original part
+objects. Conformance coverage checks this transport boundary; it does not
+claim successful live-provider replay or undocumented argument-binding
+behavior. See [Google's thought-signature guide](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures).
+
+### Structured traversal boundaries
+
+V2 metadata, error objects, and structured history inputs/result values use
+a shared 200,000-character budget, at most 10,000 value visits per traversal,
+and a 128-container path limit. String tool-call inputs use the same budget.
+Cyclic back-edges, deeper branches, and leaves exceeding the remaining
+budget stay unchanged. Independent siblings continue, and each skip reason
+produces one payload-free warning per traversal. Tracking ancestors rather
+than all visited objects allows shared, acyclic inputs to be redacted at
+each occurrence without mutating their source. When the visit budget runs
+out, unvisited branches remain unchanged. Copy-on-write preserves own property
+descriptors, prototypes, throwing accessors, and sparse array holes; it creates
+request snapshots, not replacements for live host class instances.
+
+V1 metadata scanning provides the same secret detection but does not promise
+these V2 depth/visit bounds or skip warnings.
+
+These are fail-open limits, not a guarantee that every secret is scanned.
+They do not bound ordinary text blocks or the targeted duplicate-output
+field. A failed system or message container logs a payload-free error without
+preventing later messages from being scanned.
+
 ### Scoped exception: `tool.execute.after` does rewrite its record
 
 The one hook whose mutation reaches a persisted record is
@@ -311,5 +344,3 @@ surfaces/persists in the tool's state; for a completed call, the hooked
 result's fields flow into what the tool returns. That is the hook's own
 upstream semantics (V1 parity), accepted as the intended design — noted
 here so the distinction with the session hooks is explicit.
-
-
