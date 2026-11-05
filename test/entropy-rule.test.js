@@ -57,8 +57,10 @@ describe("entropy exemption boundaries", () => {
 
   it("Detects secrets adjacent to exempt spans", () => {
     for (const token of [secret, short]) {
-      for (const span of [`https://example.invalid/${token}`, `/${token}`, `C:\\${token}`]) {
-        for (const [open, close] of [["`", "`"], ["[", "]"], ["{", "}"], ["(", ")"], ["<", ">"], ['"', '"'], ["'", "'"], [" ", " "]]) {
+      for (const span of [`https://example.invalid/${token}`, `/${token}`, `C:\\${token}`, `DEST=/${token}`, `DEST=C:\\${token}`]) {
+        const delimiters = span.startsWith("DEST=") ? [["`", "`"]] :
+          [["`", "`"], ["[", "]"], ["{", "}"], ["(", ")"], ["<", ">"], ['"', '"'], ["'", "'"], [" ", " "]];
+        for (const [open, close] of delimiters) {
           const text = `${open}${span}${close}${token}`;
           expect(findHighEntropyFindings(text), text).toEqual([
             { start: text.length - token.length, end: text.length },
@@ -70,16 +72,21 @@ describe("entropy exemption boundaries", () => {
 
   it("Detects outside fragments of candidates crossing exemption boundaries", () => {
     for (const token of [secret, short]) {
-      const text = `${token}=https://example.invalid/${token}`;
+      const label = token === secret ? `a${token}` : token;
       // '=' belongs to the generic alphabet, but not the short-password alphabet.
-      const outside = token === secret ? `${token}=` : token;
-      expect(findHighEntropyFindings(text)).toEqual([{ start: 0, end: outside.length }]);
+      const outside = token === secret ? `${label}=` : label;
+      const values = [`https://example.invalid/${token}`];
+      if (token === secret) values.push(`/${token}`, `C:\\${token}`);
+      for (const value of values) {
+        const text = `${label}=${value}`;
+        expect(findHighEntropyFindings(text), text).toEqual([{ start: 0, end: outside.length }]);
+      }
     }
   });
 
   it("Keeps JWT signature detection active inside exempt spans", () => {
     const jwt = `eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIn0.${secret}`; // pragma: allowlist secret -- unsigned synthetic claims and generated signature
-    for (const text of [`https://example.invalid/${jwt}`, `/tmp/${jwt}`, `C:\\tmp\\${jwt}`]) {
+    for (const text of [`https://example.invalid/${jwt}`, `/tmp/${jwt}`, `C:\\tmp\\${jwt}`, `DEST=/tmp/${jwt}`, `DEST=C:\\tmp\\${jwt}`]) {
       const start = text.indexOf(secret);
       expect(findHighEntropyFindings(text)).toEqual([{ start, end: start + secret.length }]);
     }
@@ -88,8 +95,10 @@ describe("entropy exemption boundaries", () => {
   it("Keeps explicit credential detection active inside exempt spans", async () => {
     const lint = createCompositeLinter(await createSecretlintConfig());
     const fixture = RULE_FIXTURES.find((entry) => entry.rule === "basicauth");
-    const messages = await lint(fixture.content, { ext: fixture.ext });
-    expect(messages.some((message) => message.messageId === fixture.messageId)).toBe(true);
+    for (const text of [fixture.content, `DEST=/tmp/${fixture.content}`, `DEST=C:\\tmp\\${fixture.content}`]) {
+      const messages = await lint(text, { ext: fixture.ext });
+      expect(messages.some((message) => message.messageId === fixture.messageId), text).toBe(true);
+    }
   });
 });
 
@@ -621,15 +630,14 @@ describe("findHighEntropyFindings — URL path false-positive fix", () => {
   });
 
   it("Leaves unanchored slash-containing credentials detectable", () => {
-    // a base64-shaped run containing '/', with no scheme:// prefix, so no
-    // URL span is detected and the run is scored exactly as before this
-    // change (unsplit).
     const secret = Array.from({ length: 36 }, (_, i) => i.toString(36)).join("");
-    const withSlash = `${secret.slice(0, 18)}/${secret.slice(18)}`;
-    const text = `value=${withSlash} end`;
-    const findings = findHighEntropyFindings(text);
-    expect(findings).toHaveLength(1);
-    expect(text.slice(findings[0].start, findings[0].end)).toBe(`value=${withSlash}`);
+    for (const separator of ["/", "=/"]) {
+      const credential = `value=${secret.slice(0, 18)}${separator}${secret.slice(18)}`;
+      const text = `${credential} end`;
+      const findings = findHighEntropyFindings(text);
+      expect(findings, text).toHaveLength(1);
+      expect(text.slice(findings[0].start, findings[0].end)).toBe(credential);
+    }
   });
 
   it("keeps a crossing candidate intact for exemption subtraction", () => {
@@ -690,11 +698,22 @@ describe("findPathSpans", () => {
   });
 
   it("finds no span for an anchor not itself sitting at a boundary character (T6)", () => {
-    expect(findPathSpans("PATH=/usr/bin:/usr/local/bin")).toEqual([]);
-    expect(findPathSpans("x=./a/b")).toEqual([]);
     expect(findPathSpans("...../a/b")).toEqual([]);
     expect(findPathSpans("no-anchor-here/foo/bar")).toEqual([]);
-    expect(findPathSpans("x=C:\\Users\\x")).toEqual([]);
+    for (const text of ["0DEST=/tmp/file", "--output=/tmp/file", "DEST=value=/tmp/file", "DEST==/tmp/file"]) {
+      expect(findPathSpans(text), text).toEqual([]);
+    }
+  });
+
+  it("returns only the anchored path span in identifier assignments", () => {
+    for (const assignment of ["PATH=/usr/bin:/usr/local/bin", "x=./a/b", "_DEST2=C:\\Data\\x", "DEST=../file", "DEST=~/file", "DEST=\\\\server\\share"]) {
+      for (const [open, close] of [["", ""], ["see `", "` here"], ["[", "]"]]) {
+        const text = `${open}${assignment}${close}`;
+        expect(findPathSpans(text), text).toEqual([
+          { start: open.length + assignment.indexOf("=") + 1, end: open.length + assignment.length },
+        ]);
+      }
+    }
   });
 
   it("finds no path span for a bare scheme:// URL (already governed by findUrlSpans) (T7)", () => {
@@ -760,9 +779,13 @@ describe("findHighEntropyFindings — filesystem path false-positive fix", () =>
         `\\\\server\\share\\${token}`, `.\\${token}`, `..\\${token}`, `~\\${token}`,
         `/${token}+suffix=`,
       ]) {
-        expect(findHighEntropyFindings(`see \`${path}\` here`), path).toEqual([]);
+        for (const text of [`see \`${path}\` here`, `DEST=${path}`, `see \`_DEST2=${path}\` here`]) {
+          expect(findHighEntropyFindings(text), text).toEqual([]);
+        }
       }
     }
+    const command = "COVERAGE_FILE=/tmp/opencode/log-test-cleanup.coverage python -m coverage run -m pytest";
+    expect(findHighEntropyFindings(command)).toEqual([]);
   });
 
   it("preserves an anchored path made of diverse short components", () => {

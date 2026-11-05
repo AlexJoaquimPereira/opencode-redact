@@ -1,0 +1,3 @@
+- [x] Update regression cases for "Preserves complete Linux and Windows filesystem paths" and existing exemption-boundary scenarios.
+- [x] Implement the captured path intervals from design.md and pass "Preserves complete Linux and Windows filesystem paths".
+- [x] Extend assigned-path cases for "Keeps explicit credential detection active inside exempt spans" and "Keeps JWT signature detection active inside exempt spans".
