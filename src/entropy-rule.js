@@ -16,7 +16,7 @@ const CANDIDATE_RUN_PATTERN = /[A-Za-z0-9+/=_-]+/g;
 // Commas and semicolons remain valid URL/path content.
 const URL_SPAN_PATTERN = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'`()[\]{}<>]+/g;
 const PATH_SPAN_PATTERN =
-  /(?<![^\s"'`()[\]{}<>])(?:[A-Za-z]:[\\/]|(?:\.\.?|~)[\\/]|\\\\|\/)[^\s"'`()[\]{}<>]*/g;
+  /(?<![^\s"'`()[\]{}<>])(?:[A-Za-z_][A-Za-z0-9_]*=)?((?:[A-Za-z]:[\\/]|(?:\.\.?|~)[\\/]|\\\\|\/)[^\s"'`()[\]{}<>]*)/g;
 const VALUE_TOKEN_PATTERN = /[^\s"'`()[\]{}<>,;]+/g;
 const NUMERIC_VALUE_PATTERN = /^(?:[A-Za-z_$][\w$]*[=:])?([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$/;
 
@@ -80,12 +80,14 @@ export function findUrlSpans(text) {
 /**
  * Finds every anchored filesystem-path-shaped span in `text`: a POSIX
  * absolute path, Windows drive or UNC path, or dot/home-relative path
- * using either separator, anchored at a boundary or the start of text.
+ * using either separator, directly or after an identifier assignment at
+ * a boundary or the start of text. Assignment labels remain scannable.
  */
 export function findPathSpans(text) {
   const spans = [];
   for (const match of text.matchAll(PATH_SPAN_PATTERN)) {
-    spans.push({ start: match.index, end: match.index + match[0].length });
+    const end = match.index + match[0].length;
+    spans.push({ start: end - match[1].length, end });
   }
   return spans;
 }
